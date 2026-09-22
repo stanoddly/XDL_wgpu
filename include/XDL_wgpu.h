@@ -1,6 +1,6 @@
 /*
   XDL_wgpu
-  Copyright (C) 2026 Stan
+  Copyright (C) 2026 Stan (stanoddly)
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
