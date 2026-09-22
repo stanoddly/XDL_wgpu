@@ -15,16 +15,8 @@
 #ifdef SDL_GPU_WEBGPU
 
 #include "SDL_sysgpu.h"
+#include "XDL_wgpu.h"
 #include <webgpu/webgpu.h>
-
-// The pinned SDL_gpu.h has no WGSL shader format; XDL_wgpu maps it onto the private slot.
-#define SDL_GPU_SHADERFORMAT_WGSL SDL_GPU_SHADERFORMAT_PRIVATE
-
-// Property names from the SDL_wgpu fork's SDL_gpu.h; stock SDL_gpu.h does not declare them.
-#define SDL_PROP_GPU_DEVICE_CREATE_WEBGPU_BINDGROUP_EXPIRE_AFTER_N_SUBMITS "SDL.gpu.device.create.webgpu.bindgroupexpiry"
-#define SDL_PROP_GPU_DEVICE_CREATE_WEBGPU_INSTANCE_POINTER                 "SDL.gpu.device.create.webgpu.instance"
-#define SDL_PROP_GPU_DEVICE_CREATE_WEBGPU_ADAPTER_POINTER                  "SDL.gpu.device.create.webgpu.adapter"
-#define SDL_PROP_GPU_DEVICE_CREATE_WEBGPU_DEVICE_POINTER                   "SDL.gpu.device.create.webgpu.device"
 
 extern WGPUSurface XDL_WGPU_CreateSurface(SDL_Window *window, WGPUInstance instance);
 
@@ -6125,9 +6117,12 @@ static void WEBGPU_SetTextureName(SDL_GPURenderer *device, SDL_GPUTexture *textu
 
 static bool WEBGPU_PrepareDriver(SDL_VideoDevice *this, SDL_PropertiesID props)
 {
-    // TODO: This.
-    // There used to be code here, but it hadn't been updated in a while.
-    // (Quite frankly, I just got annoyed that it clogged the console with debug device creation information since it uses the same functions)
+    // Like the other backends, only answer to a shader format we can consume; PRIVATE is not ours.
+    if (!SDL_GetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_WGSL_BOOLEAN, false)) {
+        return false;
+    }
+
+    // TODO: There used to be device probing here, but it hadn't been updated in a while.
     return true;
 }
 

@@ -26,15 +26,19 @@ The library is built against SDL `release-3.4.16` (git submodule `external/SDL`)
 
 `src/SDL_gpu.c` and `src/SDL_sysgpu.h` are copies from the pinned SDL with one change (the backend table) and are owned by this repository.
 
-## Shader format: PRIVATE means WGSL
+## Shader format: WGSL
 
-Stock `SDL_gpu.h` has no WGSL shader format, so this backend uses `SDL_GPU_SHADERFORMAT_PRIVATE` for WGSL:
+Stock `SDL_gpu.h` has no WGSL shader format. `include/XDL_wgpu.h` adds `SDL_GPU_SHADERFORMAT_WGSL` (`1u << 6`, the value used by the SDL_wgpu fork and the upstream PR), and this library's `SDL_gpu.c` understands it:
 
 ```c
-SDL_GPUDevice *device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_PRIVATE, debug, NULL);
+#include <XDL_wgpu.h>
 
-SDL_GPUShaderCreateInfo info = { .code = wgsl_source, .code_size = wgsl_size, .format = SDL_GPU_SHADERFORMAT_PRIVATE, .entrypoint = "main", ... };
+SDL_GPUDevice *device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_WGSL, debug, NULL);
+
+SDL_GPUShaderCreateInfo info = { .code = wgsl_source, .code_size = wgsl_size, .format = SDL_GPU_SHADERFORMAT_WGSL, .entrypoint = "main", ... };
 ```
+
+`SDL_GPU_SHADERFORMAT_PRIVATE` keeps its stock meaning and is not accepted by this backend. Bindings that cannot include the header define the bit themselves (`1u << 6`).
 
 `SDL_HINT_GPU_DRIVER` works as usual; the driver name is `webgpu`.
 
@@ -48,7 +52,7 @@ WebGPU is asynchronous. The backend's adapter and device requests, `SDL_WaitForG
 
 If you cannot use asyncify (for example the .NET browser runtime):
 
-1. Obtain the `WGPUInstance`, `WGPUAdapter` and `WGPUDevice` yourself, asynchronously, and hand all three to `SDL_CreateGPUDeviceWithProperties()`. This skips the request loops. The property names are not in stock `SDL_gpu.h`; use the strings directly:
+1. Obtain the `WGPUInstance`, `WGPUAdapter` and `WGPUDevice` yourself, asynchronously, and hand all three to `SDL_CreateGPUDeviceWithProperties()` together with `SDL_PROP_GPU_DEVICE_CREATE_SHADERS_WGSL_BOOLEAN`. This skips the request loops. The property names are in `include/XDL_wgpu.h`:
 
    | Property | Type | String |
    |---|---|---|
@@ -85,7 +89,7 @@ Options:
 
 ### Test
 
-`test/test.c` uses only public SDL headers. It prints the driver list, creates a device with `SDL_GPU_SHADERFORMAT_PRIVATE`, claims a window, clears textures to (1, 0.5, 0.25, 1) and reads them back (64x4 RGBA8 direct; 5x3 RGBA8, 3x2 R8 and a 64x1 RGBA8 at buffer offset 2 through the padded staging path), then submits three swapchain frames.
+`test/test.c` uses only public headers (SDL3 and `XDL_wgpu.h`). It prints the driver list, checks that `SDL_GPU_SHADERFORMAT_PRIVATE` is rejected, creates a device with `SDL_GPU_SHADERFORMAT_WGSL`, claims a window, clears textures to (1, 0.5, 0.25, 1) and reads them back (64x4 RGBA8 direct; 5x3 RGBA8, 3x2 R8 and a 64x1 RGBA8 at buffer offset 2 through the padded staging path), then submits three swapchain frames.
 
 ```
 tools/run-test.sh
@@ -96,6 +100,8 @@ The script serves `build/out/test` and drives headless Chromium through `playwri
 ```
 SDL_GetNumGPUDrivers() = 1
 GPU driver 0: webgpu
+SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_PRIVATE) rejected: No supported SDL_GPU backend found!
+Device shader formats: 0x40
 Device driver: webgpu
 Readback 64x4: 255 128 64 255 (uniform: yes)
 Readback 5x3 last pixel: 255 128 64 255 (uniform: yes)
@@ -131,7 +137,8 @@ Build the library with the same exception flags as the runtime (`-DXDL_EMSCRIPTE
 
 | Path | Contents |
 |---|---|
-| `src/SDL_gpu.c`, `src/SDL_sysgpu.h` | SDL 3.4.16's GPU front end; backend table is `{ &WebGPUDriver, NULL }` |
+| `include/XDL_wgpu.h` | `SDL_GPU_SHADERFORMAT_WGSL` and the WebGPU device-creation properties |
+| `src/SDL_gpu.c`, `src/SDL_sysgpu.h` | SDL 3.4.16's GPU front end; backend table is `{ &WebGPUDriver, NULL }`, WGSL format mapped to its property |
 | `src/SDL_gpu_webgpu.c` | The WebGPU backend from SDL_wgpu, adapted to the port header and the pinned vtable |
 | `src/SDL_wgpu_surface.c` | `WGPUSurface` from the window's Emscripten canvas selector |
 | `test/` | Smoke test page |

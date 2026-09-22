@@ -20,6 +20,7 @@
 */
 #include "SDL_internal.h"
 #include "SDL_sysgpu.h"
+#include "XDL_wgpu.h"
 
 // FIXME: This could probably use SDL_ObjectValid
 #define CHECK_DEVICE_MAGIC(device, retval)  \
@@ -648,6 +649,9 @@ static void SDL_GPU_FillProperties(
     }
     if (format_flags & SDL_GPU_SHADERFORMAT_METALLIB) {
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_METALLIB_BOOLEAN, true);
+    }
+    if (format_flags & SDL_GPU_SHADERFORMAT_WGSL) {
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_WGSL_BOOLEAN, true);
     }
     SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, debug_mode);
     SDL_SetStringProperty(props, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, name);

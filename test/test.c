@@ -2,6 +2,7 @@
 #define SDL_MAIN_USE_CALLBACKS 1
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
+#include <XDL_wgpu.h>
 
 #define TEST_WIDTH 64
 #define TEST_HEIGHT 4
@@ -113,11 +114,19 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
     AppState *state = SDL_calloc(1, sizeof(*state));
     *appstate = state;
 
-    state->device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_PRIVATE, true, NULL);
+    // PRIVATE keeps its stock meaning (a platform-private format) and must not select this backend.
+    if (SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_PRIVATE, true, NULL) != NULL) {
+        SDL_Log("SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_PRIVATE) unexpectedly succeeded");
+        return SDL_APP_FAILURE;
+    }
+    SDL_Log("SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_PRIVATE) rejected: %s", SDL_GetError());
+
+    state->device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_WGSL, true, NULL);
     if (!state->device) {
         SDL_Log("SDL_CreateGPUDevice failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
+    SDL_Log("Device shader formats: 0x%x", (unsigned)SDL_GetGPUShaderFormats(state->device));
     SDL_Log("Device driver: %s", SDL_GetGPUDeviceDriver(state->device));
 
     state->window = SDL_CreateWindow("XDL_wgpu test", 256, 256, 0);
