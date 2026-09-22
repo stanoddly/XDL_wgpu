@@ -948,12 +948,13 @@ typedef struct WebGPUBindGroup
     bool invalid;
 } WebGPUBindGroup;
 
-// A download whose destination layout WebGPU cannot write directly (row pitch not a multiple of 256, unaligned
-// offset). The GPU copies into a 256-byte-padded staging buffer; the rows are repacked on the CPU when the
-// transfer buffer is mapped. Once a buffer has one of these pending, every later download into it is staged
-// too, so the jobs replay in submission order.
+// Every download into a transfer buffer goes through a staging buffer with 256-byte-padded rows, because WebGPU
+// cannot write most SDL layouts (row pitch not a multiple of 256, unaligned offset) and mixing direct writes with
+// staged ones would break ordering. The rows are repacked on the CPU when the transfer buffer is mapped. Jobs are
+// queued on the command buffer and published to the target buffer generation on submit, in submission order.
 typedef struct WebGPUDownloadRepack
 {
+    WebGPUBuffer *target;
     WebGPUBuffer *staging;
     Uint32 destinationOffset;
     Uint32 destinationBytesPerRow;
@@ -1261,6 +1262,11 @@ typedef struct WebGPUCommandBuffer
     WebGPUComputePipeline *boundComputePipeline;
 
     WebGPUSubmittedCommandBuffer submitted;
+
+    // Downloads recorded by this command buffer; moved to their target buffers on submit, dropped on cancel.
+    WebGPUDownloadRepack *queuedRepacks;
+    Uint32 queuedRepackCount;
+    Uint32 queuedRepackCapacity;
 
     // These'll run right before the command buffer is submitted.
     WebGPUQueuedUniformDataUpload *queuedUniformUploads;
@@ -1836,8 +1842,28 @@ static void WEBGPU_INTERNAL_ClearComputePassBindings(WebGPUCommandBuffer *cmdBuf
     cmdBuf->computeStageBinds.readWriteStorageBindGroupOutdated = true;
 }
 
+static void WEBGPU_INTERNAL_ReleaseBuffer(WebGPURenderer *renderer, WebGPUBuffer *buffer);
+
+static void WEBGPU_INTERNAL_DropQueuedRepacks(WebGPUCommandBuffer *cmdBuf)
+{
+    for (Uint32 i = 0; i < cmdBuf->queuedRepackCount; i++) {
+        WEBGPU_INTERNAL_ReleaseBuffer(cmdBuf->renderer, cmdBuf->queuedRepacks[i].staging);
+    }
+    cmdBuf->queuedRepackCount = 0;
+}
+
+static void WEBGPU_INTERNAL_PublishQueuedRepacks(WebGPUCommandBuffer *cmdBuf)
+{
+    for (Uint32 i = 0; i < cmdBuf->queuedRepackCount; i++) {
+        WebGPUBuffer *target = cmdBuf->queuedRepacks[i].target;
+        WEBGPU_INTERNAL_InsertElementIntoArray(target->pendingRepacks, target->pendingRepackCapacity, target->pendingRepackCount, WebGPUDownloadRepack, cmdBuf->queuedRepacks[i]);
+    }
+    cmdBuf->queuedRepackCount = 0;
+}
+
 static void WEBGPU_INTERNAL_FreeCommandBuffer(WebGPUCommandBuffer *cmdBuf)
 {
+    SDL_free(cmdBuf->queuedRepacks);
     SDL_free(cmdBuf->surfaces);
     SDL_free(cmdBuf->acquiredSwapchainTextures);
     SDL_free(cmdBuf->queuedUniformUploads);
@@ -5436,6 +5462,7 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
         for (int i = 0; i < wrapper->numQueuedUniformUploads; i++) {
             SDL_free(wrapper->queuedUniformUploads[i].data);
         }
+        WEBGPU_INTERNAL_DropQueuedRepacks(wrapper);
         WEBGPU_INTERNAL_ReleaseTrackedResources(&wrapper->submitted);
         WEBGPU_INTERNAL_ReleaseAcquiredSwapchainTextures(wrapper);
         wgpuCommandEncoderRelease(wrapper->encoder);
@@ -5460,6 +5487,7 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
                                            wrapper->renderer->submittedCommandBufferCount, WebGPUSubmittedCommandBuffer *, submitted);
 
     wgpuQueueSubmit(wrapper->queue, 1, &cmdBuf);
+    WEBGPU_INTERNAL_PublishQueuedRepacks(wrapper);
 
     if (isMainThread) {
 #ifndef __EMSCRIPTEN__
@@ -5585,32 +5613,46 @@ static void WEBGPU_ReleaseWindow(SDL_GPURenderer *driverData, SDL_Window *window
     SDL_free(windowData);
 }
 
+static void WEBGPU_INTERNAL_TrackBuffer(WebGPUCommandBuffer *cmdBuf, WebGPUBuffer *buffer)
+{
+    SDL_AtomicIncRef(&buffer->referenceCount);
+    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedBuffers, cmdBuf->submitted.usedBufferCapacity, cmdBuf->submitted.usedBufferCount, WebGPUBuffer *, buffer);
+}
+
 static void WEBGPU_DownloadFromTexture(SDL_GPUCommandBuffer *commandBuffer, const SDL_GPUTextureRegion *source, const SDL_GPUTextureTransferInfo *destination)
 {
     WebGPUCommandBuffer *cmdBuf = (WebGPUCommandBuffer *)commandBuffer;
     WebGPUTexture *texture = ((WebGPUTextureContainer *)source->texture)->activeTexture;
-    WebGPUBufferContainer *container = (WebGPUBufferContainer *)destination->transfer_buffer;
+    WebGPUBuffer *target = ((WebGPUBufferContainer *)destination->transfer_buffer)->activeBuffer;
 
     Uint32 blockWidth = Texture_GetBlockWidth(texture->format);
     Uint32 blockHeight = Texture_GetBlockHeight(texture->format);
-    Uint32 texelBlockSize = SDL_GPUTextureFormatTexelBlockSize(texture->format);
 
     Uint32 paddedWidth = ALIGN_VALUE(source->w, blockWidth);
     Uint32 paddedHeight = ALIGN_VALUE(source->h, blockHeight);
     Uint32 layerCount = SDL_max(source->d, 1);
     Uint32 blockRowsPerLayer = (source->h + blockHeight - 1) / blockHeight;
     Uint32 bytesPerRow = BytesPerRow(source->w, texture->format);
+    Uint32 paddedBytesPerRow = ALIGN_VALUE(bytesPerRow, 256);
 
     // The app buffer layout is what SDL_GPUTextureTransferInfo describes: pixels_per_row / rows_per_layer of 0 mean tightly packed.
     Uint32 pixelsPerRowDest = destination->pixels_per_row != 0 ? destination->pixels_per_row : source->w;
     Uint32 rowsPerLayerDest = destination->rows_per_layer != 0 ? destination->rows_per_layer : source->h;
-    Uint32 bytesPerRowDest = BytesPerRow(pixelsPerRowDest, texture->format);
-    Uint32 blockRowsPerLayerDest = (rowsPerLayerDest + blockHeight - 1) / blockHeight;
 
-    // WebGPU can write the app layout directly only with 256-byte-aligned rows and a texel-block-aligned offset,
-    // and only while no earlier download into this buffer is still waiting to be repacked (order would flip).
-    Uint32 offsetAlignment = (IsDepthFormat(texture->format) || IsStencilFormat(texture->format)) ? 4 : texelBlockSize;
-    bool direct = bytesPerRowDest % 256 == 0 && destination->offset % offsetAlignment == 0 && container->activeBuffer->pendingRepackCount == 0;
+    WebGPUBuffer *staging = WEBGPU_INTERNAL_CreateBuffer(cmdBuf->renderer, paddedBytesPerRow * blockRowsPerLayer * layerCount, 0,
+                                                         WEBGPU_BUFFER_TYPE_TRANSFER_DOWNLOAD, "Texture Download Staging Buffer");
+    WebGPUDownloadRepack repack = {
+        .target = target,
+        .staging = staging,
+        .destinationOffset = destination->offset,
+        .destinationBytesPerRow = BytesPerRow(pixelsPerRowDest, texture->format),
+        .destinationBlockRowsPerLayer = (rowsPerLayerDest + blockHeight - 1) / blockHeight,
+        .bytesPerRow = bytesPerRow,
+        .paddedBytesPerRow = paddedBytesPerRow,
+        .blockRowsPerLayer = blockRowsPerLayer,
+        .layerCount = layerCount,
+    };
+    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->queuedRepacks, cmdBuf->queuedRepackCapacity, cmdBuf->queuedRepackCount, WebGPUDownloadRepack, repack);
 
     WGPUTexelCopyTextureInfo sourceInfo = {
         .aspect = WGPUTextureAspect_All,
@@ -5618,41 +5660,13 @@ static void WEBGPU_DownloadFromTexture(SDL_GPUCommandBuffer *commandBuffer, cons
         .mipLevel = source->mip_level,
         .origin = (WGPUOrigin3D){ source->x, source->y, source->z + source->layer },
     };
-
-    WGPUTexelCopyBufferInfo destInfo;
-    if (direct) {
-        destInfo = (WGPUTexelCopyBufferInfo){
-            .buffer = container->activeBuffer->buffer,
-            .layout = (WGPUTexelCopyBufferLayout){ .bytesPerRow = bytesPerRowDest, .rowsPerImage = blockRowsPerLayerDest, .offset = destination->offset },
-        };
-    } else {
-        Uint32 paddedBytesPerRow = ALIGN_VALUE(bytesPerRow, 256);
-        WebGPUBuffer *staging = WEBGPU_INTERNAL_CreateBuffer(cmdBuf->renderer, paddedBytesPerRow * blockRowsPerLayer * layerCount, 0,
-                                                             WEBGPU_BUFFER_TYPE_TRANSFER_DOWNLOAD, "Padded Texture Download Buffer");
-        WebGPUDownloadRepack repack = {
-            .staging = staging,
-            .destinationOffset = destination->offset,
-            .destinationBytesPerRow = bytesPerRowDest,
-            .destinationBlockRowsPerLayer = blockRowsPerLayerDest,
-            .bytesPerRow = bytesPerRow,
-            .paddedBytesPerRow = paddedBytesPerRow,
-            .blockRowsPerLayer = blockRowsPerLayer,
-            .layerCount = layerCount,
-        };
-        WEBGPU_INTERNAL_InsertElementIntoArray(container->activeBuffer->pendingRepacks, container->activeBuffer->pendingRepackCapacity,
-                                               container->activeBuffer->pendingRepackCount, WebGPUDownloadRepack, repack);
-
-        destInfo = (WGPUTexelCopyBufferInfo){
-            .buffer = staging->buffer,
-            .layout = (WGPUTexelCopyBufferLayout){ .bytesPerRow = paddedBytesPerRow, .rowsPerImage = blockRowsPerLayer, .offset = 0 },
-        };
-    }
-
+    WGPUTexelCopyBufferInfo destInfo = {
+        .buffer = staging->buffer,
+        .layout = (WGPUTexelCopyBufferLayout){ .bytesPerRow = paddedBytesPerRow, .rowsPerImage = blockRowsPerLayer, .offset = 0 },
+    };
     wgpuCommandEncoderCopyTextureToBuffer(cmdBuf->encoder, &sourceInfo, &destInfo, &(WGPUExtent3D){ paddedWidth, paddedHeight, layerCount });
 
-    SDL_AtomicIncRef(&container->activeBuffer->referenceCount);
-    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedBuffers, cmdBuf->submitted.usedBufferCapacity,
-                                           cmdBuf->submitted.usedBufferCount, WebGPUBuffer *, container->activeBuffer);
+    WEBGPU_INTERNAL_TrackBuffer(cmdBuf, target);
 
     SDL_AtomicIncRef(&texture->referenceCount);
     WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedTextures, cmdBuf->submitted.usedTextureCapacity,
@@ -5803,20 +5817,13 @@ static bool WEBGPU_SupportsSampleCount(SDL_GPURenderer *driverData, SDL_GPUTextu
 static void WEBGPU_DownloadFromBuffer(SDL_GPUCommandBuffer *commandBuffer, const SDL_GPUBufferRegion *source, const SDL_GPUTransferBufferLocation *destination)
 {
     WebGPUCommandBuffer *cmdBuf = (WebGPUCommandBuffer *)commandBuffer;
+    WebGPUBuffer *sourceBuffer = ((WebGPUBufferContainer *)source->buffer)->activeBuffer;
     WebGPUBuffer *target = ((WebGPUBufferContainer *)destination->transfer_buffer)->activeBuffer;
     Uint32 size = ALIGN_VALUE(source->size, 4);
 
-    if (target->pendingRepackCount == 0) {
-        WEBGPU_INTERNAL_CopyBufferToBuffer(cmdBuf->encoder, (WebGPUBufferContainer *)source->buffer, source->offset,
-                                           (WebGPUBufferContainer *)destination->transfer_buffer, destination->offset, size);
-        return;
-    }
-
-    // An earlier texture download into this buffer is waiting to be repacked; stage this copy so it lands after it.
-    WebGPUBuffer *staging = WEBGPU_INTERNAL_CreateBuffer(cmdBuf->renderer, size, 0, WEBGPU_BUFFER_TYPE_TRANSFER_DOWNLOAD, "Ordered Buffer Download Buffer");
-    wgpuCommandEncoderCopyBufferToBuffer(cmdBuf->encoder, ((WebGPUBufferContainer *)source->buffer)->activeBuffer->buffer, source->offset, staging->buffer, 0, size);
-
+    WebGPUBuffer *staging = WEBGPU_INTERNAL_CreateBuffer(cmdBuf->renderer, size, 0, WEBGPU_BUFFER_TYPE_TRANSFER_DOWNLOAD, "Buffer Download Staging Buffer");
     WebGPUDownloadRepack repack = {
+        .target = target,
         .staging = staging,
         .destinationOffset = destination->offset,
         .destinationBytesPerRow = source->size,
@@ -5826,7 +5833,12 @@ static void WEBGPU_DownloadFromBuffer(SDL_GPUCommandBuffer *commandBuffer, const
         .blockRowsPerLayer = 1,
         .layerCount = 1,
     };
-    WEBGPU_INTERNAL_InsertElementIntoArray(target->pendingRepacks, target->pendingRepackCapacity, target->pendingRepackCount, WebGPUDownloadRepack, repack);
+    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->queuedRepacks, cmdBuf->queuedRepackCapacity, cmdBuf->queuedRepackCount, WebGPUDownloadRepack, repack);
+
+    wgpuCommandEncoderCopyBufferToBuffer(cmdBuf->encoder, sourceBuffer->buffer, source->offset, staging->buffer, 0, size);
+
+    WEBGPU_INTERNAL_TrackBuffer(cmdBuf, sourceBuffer);
+    WEBGPU_INTERNAL_TrackBuffer(cmdBuf, target);
 }
 
 static bool WEBGPU_SetAllowedFramesInFlight(SDL_GPURenderer *driverData, Uint32 allowedFramesInFlight)
@@ -5919,6 +5931,7 @@ static bool WEBGPU_Cancel(SDL_GPUCommandBuffer *commandBuffer)
         SDL_free(wrapper->queuedUniformUploads[i].data);
     }
 
+    WEBGPU_INTERNAL_DropQueuedRepacks(wrapper);
     WEBGPU_INTERNAL_ReleaseTrackedResources(&wrapper->submitted);
     WEBGPU_INTERNAL_ReleaseAcquiredSwapchainTextures(wrapper);
     wgpuCommandEncoderRelease(wrapper->encoder);
