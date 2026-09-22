@@ -16,11 +16,17 @@ typedef struct AppState
     int frames_submitted;
 } AppState;
 
-static bool ClearAndDownload(SDL_GPUDevice *device, Uint32 width, Uint32 height, Uint8 *out_pixels)
+static Uint32 BytesPerPixel(SDL_GPUTextureFormat format)
+{
+    return format == SDL_GPU_TEXTUREFORMAT_R8_UNORM ? 1 : 4;
+}
+
+// Clears a width x height texture to (1, 0.5, 0.25, 1) and downloads it to out_pixels + offset, tightly packed.
+static bool ClearAndDownload(SDL_GPUDevice *device, SDL_GPUTextureFormat format, Uint32 width, Uint32 height, Uint32 offset, Uint8 *out_pixels)
 {
     SDL_GPUTextureCreateInfo texture_info = {
         .type = SDL_GPU_TEXTURETYPE_2D,
-        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .format = format,
         .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
         .width = width,
         .height = height,
@@ -32,7 +38,7 @@ static bool ClearAndDownload(SDL_GPUDevice *device, Uint32 width, Uint32 height,
         return SDL_SetError("SDL_CreateGPUTexture: %s", SDL_GetError());
     }
 
-    Uint32 byte_count = width * height * 4;
+    Uint32 byte_count = offset + width * height * BytesPerPixel(format);
     SDL_GPUTransferBufferCreateInfo transfer_info = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = byte_count };
     SDL_GPUTransferBuffer *transfer = SDL_CreateGPUTransferBuffer(device, &transfer_info);
     if (!transfer) {
@@ -51,7 +57,7 @@ static bool ClearAndDownload(SDL_GPUDevice *device, Uint32 width, Uint32 height,
 
     SDL_GPUCopyPass *copy_pass = SDL_BeginGPUCopyPass(cmd);
     SDL_GPUTextureRegion region = { .texture = texture, .w = width, .h = height, .d = 1 };
-    SDL_GPUTextureTransferInfo destination = { .transfer_buffer = transfer };
+    SDL_GPUTextureTransferInfo destination = { .transfer_buffer = transfer, .offset = offset };
     SDL_DownloadFromGPUTexture(copy_pass, &region, &destination);
     SDL_EndGPUCopyPass(copy_pass);
 
@@ -74,10 +80,10 @@ static bool ClearAndDownload(SDL_GPUDevice *device, Uint32 width, Uint32 height,
     return true;
 }
 
-static bool PixelsAreUniform(const Uint8 *pixels, Uint32 width, Uint32 height)
+static bool PixelsAreUniform(const Uint8 *pixels, Uint32 count, Uint32 bytes_per_pixel)
 {
-    for (Uint32 i = 1; i < width * height; i++) {
-        if (SDL_memcmp(pixels, pixels + i * 4, 4) != 0) {
+    for (Uint32 i = 1; i < count; i++) {
+        if (SDL_memcmp(pixels, pixels + i * bytes_per_pixel, bytes_per_pixel) != 0) {
             return false;
         }
     }
@@ -113,21 +119,39 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
         return SDL_APP_FAILURE;
     }
 
+    // 256-byte rows at offset 0: WebGPU writes the app layout directly.
     static Uint8 pixels[TEST_WIDTH * TEST_HEIGHT * 4];
-    if (!ClearAndDownload(state->device, TEST_WIDTH, TEST_HEIGHT, pixels)) {
+    if (!ClearAndDownload(state->device, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, TEST_WIDTH, TEST_HEIGHT, 0, pixels)) {
         SDL_Log("Clear and download failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
-    SDL_Log("Readback %dx%d: %u %u %u %u (uniform: %s)", TEST_WIDTH, TEST_HEIGHT, pixels[0], pixels[1], pixels[2], pixels[3], PixelsAreUniform(pixels, TEST_WIDTH, TEST_HEIGHT) ? "yes" : "no");
+    SDL_Log("Readback %dx%d: %u %u %u %u (uniform: %s)", TEST_WIDTH, TEST_HEIGHT, pixels[0], pixels[1], pixels[2], pixels[3], PixelsAreUniform(pixels, TEST_WIDTH * TEST_HEIGHT, 4) ? "yes" : "no");
 
-    // A row narrower than 256 bytes exercises the unpadded download path.
+    // Rows narrower than 256 bytes go through the padded staging buffer and are repacked on map.
     static Uint8 narrow_pixels[NARROW_WIDTH * NARROW_HEIGHT * 4];
-    if (!ClearAndDownload(state->device, NARROW_WIDTH, NARROW_HEIGHT, narrow_pixels)) {
+    if (!ClearAndDownload(state->device, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, NARROW_WIDTH, NARROW_HEIGHT, 0, narrow_pixels)) {
         SDL_Log("Narrow clear and download failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
     const Uint8 *last = narrow_pixels + (NARROW_WIDTH * NARROW_HEIGHT - 1) * 4;
-    SDL_Log("Readback %dx%d last pixel: %u %u %u %u (uniform: %s)", NARROW_WIDTH, NARROW_HEIGHT, last[0], last[1], last[2], last[3], PixelsAreUniform(narrow_pixels, NARROW_WIDTH, NARROW_HEIGHT) ? "yes" : "no");
+    SDL_Log("Readback %dx%d last pixel: %u %u %u %u (uniform: %s)", NARROW_WIDTH, NARROW_HEIGHT, last[0], last[1], last[2], last[3], PixelsAreUniform(narrow_pixels, NARROW_WIDTH * NARROW_HEIGHT, 4) ? "yes" : "no");
+
+    // 3-byte rows of a one-byte format: neither the rows nor the row offsets are 4-byte aligned.
+    static Uint8 r8_pixels[3 * 2];
+    if (!ClearAndDownload(state->device, SDL_GPU_TEXTUREFORMAT_R8_UNORM, 3, 2, 0, r8_pixels)) {
+        SDL_Log("R8 clear and download failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    SDL_Log("Readback R8 3x2: %u %u %u / %u %u %u", r8_pixels[0], r8_pixels[1], r8_pixels[2], r8_pixels[3], r8_pixels[4], r8_pixels[5]);
+
+    // 256-byte rows but a destination offset that is not texel aligned.
+    static Uint8 offset_pixels[2 + TEST_WIDTH * 4];
+    SDL_memset(offset_pixels, 7, sizeof(offset_pixels));
+    if (!ClearAndDownload(state->device, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, TEST_WIDTH, 1, 2, offset_pixels)) {
+        SDL_Log("Offset clear and download failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    SDL_Log("Readback %dx1 at offset 2: %u %u %u %u (uniform: %s)", TEST_WIDTH, offset_pixels[2], offset_pixels[3], offset_pixels[4], offset_pixels[5], PixelsAreUniform(offset_pixels + 2, TEST_WIDTH, 4) ? "yes" : "no");
 
     return SDL_APP_CONTINUE;
 }

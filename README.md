@@ -85,7 +85,7 @@ Options:
 
 ### Test
 
-`test/test.c` uses only public SDL headers. It prints the driver list, creates a device with `SDL_GPU_SHADERFORMAT_PRIVATE`, claims a window, clears a 64x4 (and a 5x3) RGBA8 texture to (1, 0.5, 0.25, 1) and reads it back, then submits three swapchain frames.
+`test/test.c` uses only public SDL headers. It prints the driver list, creates a device with `SDL_GPU_SHADERFORMAT_PRIVATE`, claims a window, clears textures to (1, 0.5, 0.25, 1) and reads them back (64x4 RGBA8 direct; 5x3 RGBA8, 3x2 R8 and a 64x1 RGBA8 at buffer offset 2 through the padded staging path), then submits three swapchain frames.
 
 ```
 tools/run-test.sh
@@ -99,6 +99,8 @@ GPU driver 0: webgpu
 Device driver: webgpu
 Readback 64x4: 255 128 64 255 (uniform: yes)
 Readback 5x3 last pixel: 255 128 64 255 (uniform: yes)
+Readback R8 3x2: 255 255 255 / 255 255 255
+Readback 64x1 at offset 2: 255 128 64 255 (uniform: yes)
 Frame 1 submitted
 Frame 2 submitted
 Frame 3 submitted
