@@ -160,3 +160,7 @@ Relative to the backend as copied into this repository:
 zlib, the same as SDL (see `LICENSE`).
 
 `src/SDL_gpu.c`, `src/SDL_sysgpu.h` and `src/SDL_gpu_webgpu.c` are derived works and keep their notices. The first two are copied from [libsdl-org/SDL](https://github.com/libsdl-org/SDL). `src/SDL_gpu_webgpu.c` is the original WebGPU backend by The Stickmahn ([TheeStickmahn/SDL_wgpu](https://github.com/TheeStickmahn/SDL_wgpu)) with substantial further changes by Stan (stanoddly); it keeps its upstream file name so it can still be diffed against the original and against [libsdl-org/SDL#16020](https://github.com/libsdl-org/SDL/pull/16020).
+
+## AI disclosure
+
+Except for the code derived from SDL and the original WebGPU backend (see [License](#license)), the work in this repository was produced with the help of LLM-based coding tools, under human direction and review. They wrote and reviewed code, and their review findings shaped the design.
