@@ -2748,13 +2748,19 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
                 continue;
             }
 
-            if (current->destroysAttempted >= 100 && current->destroysAttempted % 100 == 0) {
-                SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Queued destroy has been attempted %i times!", current->destroysAttempted);
-            }
+            // While the device is being destroyed, WEBGPU_DestroyDevice forces releases itself, and only after abandoning the
+            // submissions that still reference resources. Its drain loop runs passes far faster than frames, so the attempt
+            // count would otherwise free a resource an in-flight submission uses, and releasing that submission later would
+            // touch freed memory.
+            if (!renderer->destroyingSelf) {
+                if (current->destroysAttempted >= 100 && current->destroysAttempted % 100 == 0) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Queued destroy has been attempted %i times!", current->destroysAttempted);
+                }
 
-            if (current->destroysAttempted >= FORCIBLY_DESTROY_QUEUED_DESTROY_AFTER_N_FAILED) {
-                SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Queued destroy has been attempted %i times! Forcibly destroying.", current->destroysAttempted);
-                forciblyDestroy = true;
+                if (current->destroysAttempted >= FORCIBLY_DESTROY_QUEUED_DESTROY_AFTER_N_FAILED) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Queued destroy has been attempted %i times! Forcibly destroying.", current->destroysAttempted);
+                    forciblyDestroy = true;
+                }
             }
 
             switch (current->type) {
