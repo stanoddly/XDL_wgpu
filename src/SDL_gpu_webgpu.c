@@ -41,6 +41,8 @@ extern WGPUSurface XDL_WGPU_CreateSurface(SDL_Window *window, WGPUInstance insta
 #define MAP_STATE_MAPPED_GPU 1
 // This means that the buffer is "pseudo-mapped". See BufferContainer.pseudoMappedRange for more.
 #define MAP_STATE_MAPPED_CPU 2
+// Download buffer whose contents were repacked on the CPU; the app holds the container's shadow copy.
+#define MAP_STATE_MAPPED_SHADOW 3
 
 static WGPUPresentMode SDLToWebGPU_PresentMode[] = {
     WGPUPresentMode_Fifo,
@@ -946,10 +948,30 @@ typedef struct WebGPUBindGroup
     bool invalid;
 } WebGPUBindGroup;
 
+// A download whose destination layout WebGPU cannot write directly (row pitch not a multiple of 256, unaligned
+// offset). The GPU copies into a 256-byte-padded staging buffer; the rows are repacked on the CPU when the
+// transfer buffer is mapped. Once a buffer has one of these pending, every later download into it is staged
+// too, so the jobs replay in submission order.
+typedef struct WebGPUDownloadRepack
+{
+    WebGPUBuffer *staging;
+    Uint32 destinationOffset;
+    Uint32 destinationBytesPerRow;
+    Uint32 destinationBlockRowsPerLayer;
+    Uint32 bytesPerRow;
+    Uint32 paddedBytesPerRow;
+    Uint32 blockRowsPerLayer;
+    Uint32 layerCount;
+} WebGPUDownloadRepack;
+
 struct WebGPUBuffer
 {
     WebGPUBufferContainer *container;
     WGPUBuffer buffer;
+
+    WebGPUDownloadRepack *pendingRepacks;
+    Uint32 pendingRepackCount;
+    Uint32 pendingRepackCapacity;
 
     WebGPUBufferType type;
     SDL_GPUBufferUsageFlags usage;
@@ -968,20 +990,6 @@ struct WebGPUBuffer
     Uint32 numDependants;
     Uint32 dependantsCapacity;
 };
-
-// A texture region downloaded into a 256-byte-padded staging buffer because the app's layout
-// (row pitch, offset) cannot be expressed as a WebGPU copy. Repacked on the CPU when the transfer buffer is mapped.
-typedef struct WebGPUTextureDownloadRepack
-{
-    WebGPUBuffer *staging;
-    Uint32 destinationOffset;
-    Uint32 destinationBytesPerRow;
-    Uint32 destinationBlockRowsPerLayer;
-    Uint32 bytesPerRow;
-    Uint32 paddedBytesPerRow;
-    Uint32 blockRowsPerLayer;
-    Uint32 layerCount;
-} WebGPUTextureDownloadRepack;
 
 struct WebGPUBufferContainer
 {
@@ -1007,10 +1015,7 @@ struct WebGPUBufferContainer
     // 2 = Mapped on CPU (Pseudo-mapping, see above)
     Uint16 mapState;
 
-    // Download transfer buffers only: repack jobs waiting for the next map, and the CPU copy they are applied to.
-    WebGPUTextureDownloadRepack *pendingRepacks;
-    Uint32 pendingRepackCount;
-    Uint32 pendingRepackCapacity;
+    // Download transfer buffers only: scratch copy that pending repacks are applied to; handed to the app on map.
     void *downloadShadow;
 
     bool dedicated;
@@ -4001,12 +4006,22 @@ static WebGPUBufferContainer *WEBGPU_INTERNAL_CreateBufferContainer(
     return bufferContainer;
 }
 
+static void WEBGPU_INTERNAL_DiscardPendingRepacks(WebGPURenderer *renderer, WebGPUBuffer *buffer)
+{
+    for (Uint32 i = 0; i < buffer->pendingRepackCount; i++) {
+        WEBGPU_INTERNAL_ReleaseBuffer(renderer, buffer->pendingRepacks[i].staging);
+    }
+    buffer->pendingRepackCount = 0;
+}
+
 static void WEBGPU_INTERNAL_ReleaseBuffer(WebGPURenderer *renderer, WebGPUBuffer *buffer)
 {
     for (int i = 0; i < buffer->numDependants; i++) {
         // WEBGPU_INTERNAL_InvalidateBindGroup(renderer, buffer->dependants[i]);
     }
 
+    WEBGPU_INTERNAL_DiscardPendingRepacks(renderer, buffer);
+    SDL_free(buffer->pendingRepacks);
     wgpuBufferRelease(buffer->buffer);
     SDL_free(buffer->dependants);
     SDL_free(buffer);
@@ -4064,10 +4079,6 @@ static void WEBGPU_INTERNAL_ReleaseBufferContainer(WebGPURenderer *renderer, Web
         container->debugName = NULL;
     }
 
-    for (int i = 0; i < container->pendingRepackCount; i++) {
-        WEBGPU_INTERNAL_ReleaseBuffer(renderer, container->pendingRepacks[i].staging);
-    }
-    SDL_free(container->pendingRepacks);
     SDL_free(container->downloadShadow);
     SDL_free(container->pseudoMappedRange);
     SDL_free(container->buffers);
@@ -4090,6 +4101,7 @@ static void WEBGPU_INTERNAL_CycleBufferContainer(WebGPURenderer *renderer, WebGP
             if (SDL_GetAtomicInt(&current->referenceCount) != 0) {
                 continue;
             } else {
+                WEBGPU_INTERNAL_DiscardPendingRepacks(renderer, current);
                 container->activeBuffer = current;
                 goto finish;
             }
@@ -4304,25 +4316,33 @@ static void *WEBGPU_INTERNAL_MapBufferRange(WebGPURenderer *renderer, WebGPUBuff
     }
 }
 
-// Copies the GPU-mapped contents into the container's CPU shadow, overlays every pending texture download
-// in the app's layout, and returns the shadow. The GPU buffer stays mapped so unmap works unchanged.
-static void *WEBGPU_INTERNAL_ApplyDownloadRepacks(WebGPURenderer *renderer, WebGPUBufferContainer *container, const void *mapped)
+// Copies the GPU buffer into the container's shadow, replays the pending downloads in submission order,
+// writes the result back so the GPU buffer is authoritative for later maps and copies, and returns the shadow.
+static void *WEBGPU_INTERNAL_ApplyDownloadRepacks(WebGPURenderer *renderer, WebGPUBufferContainer *container)
 {
-    if (container->downloadShadow == NULL) {
-        container->downloadShadow = SDL_malloc(container->size);
-    }
-    SDL_memcpy(container->downloadShadow, mapped, container->size);
+    WebGPUBuffer *buffer = container->activeBuffer;
+    Uint64 shadowSize = buffer->size;
 
-    for (Uint32 i = 0; i < container->pendingRepackCount; i++) {
-        WebGPUTextureDownloadRepack *repack = &container->pendingRepacks[i];
+    if (!WEBGPU_INTERNAL_MapBuffer(renderer, buffer)) {
+        SDL_SetError("Failed to map buffer!");
+        return NULL;
+    }
+    if (container->downloadShadow == NULL) {
+        container->downloadShadow = SDL_malloc(shadowSize);
+    }
+    SDL_memcpy(container->downloadShadow, wgpuBufferGetConstMappedRange(buffer->buffer, 0, shadowSize), shadowSize);
+    wgpuBufferUnmap(buffer->buffer);
+
+    for (Uint32 i = 0; i < buffer->pendingRepackCount; i++) {
+        WebGPUDownloadRepack *repack = &buffer->pendingRepacks[i];
 
         if (WEBGPU_INTERNAL_MapBuffer(renderer, repack->staging)) {
             const Uint8 *source = wgpuBufferGetConstMappedRange(repack->staging->buffer, 0, repack->staging->size);
             for (Uint32 layer = 0; layer < repack->layerCount; layer++) {
                 for (Uint32 row = 0; row < repack->blockRowsPerLayer; row++) {
                     Uint64 destinationOffset = repack->destinationOffset + (Uint64)(layer * repack->destinationBlockRowsPerLayer + row) * repack->destinationBytesPerRow;
-                    if (destinationOffset + repack->bytesPerRow > container->size) {
-                        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Texture download does not fit in the transfer buffer; truncating");
+                    if (destinationOffset + repack->bytesPerRow > shadowSize) {
+                        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Download does not fit in the transfer buffer; truncating");
                         break;
                     }
                     SDL_memcpy((Uint8 *)container->downloadShadow + destinationOffset, source + (layer * repack->blockRowsPerLayer + row) * repack->paddedBytesPerRow, repack->bytesPerRow);
@@ -4330,11 +4350,13 @@ static void *WEBGPU_INTERNAL_ApplyDownloadRepacks(WebGPURenderer *renderer, WebG
             }
             wgpuBufferUnmap(repack->staging->buffer);
         } else {
-            SDL_LogError(SDL_LOG_CATEGORY_GPU, "Could not map texture download staging buffer; region left unfilled");
+            SDL_LogError(SDL_LOG_CATEGORY_GPU, "Could not map download staging buffer; region left unfilled");
         }
-        WEBGPU_INTERNAL_ReleaseBuffer(renderer, repack->staging);
     }
-    container->pendingRepackCount = 0;
+    WEBGPU_INTERNAL_DiscardPendingRepacks(renderer, buffer);
+
+    // Download buffers are CopyDst, so the queue can write the merged bytes back; the next map waits for it.
+    wgpuQueueWriteBuffer(renderer->queue, buffer->buffer, 0, container->downloadShadow, shadowSize);
 
     return container->downloadShadow;
 }
@@ -4358,24 +4380,24 @@ static void *WEBGPU_MapTransferBuffer(SDL_GPURenderer *device, SDL_GPUTransferBu
 
         return ((WebGPUBufferContainer *)transferBuffer)->pseudoMappedRange;
     } else {
+        if (((WebGPUBufferContainer *)transferBuffer)->activeBuffer->pendingRepackCount > 0) {
+            ((WebGPUBufferContainer *)transferBuffer)->mapState = MAP_STATE_MAPPED_SHADOW;
+            return WEBGPU_INTERNAL_ApplyDownloadRepacks((WebGPURenderer *)device, (WebGPUBufferContainer *)transferBuffer);
+        }
+
         // Mapped on GPU.
         ((WebGPUBufferContainer *)transferBuffer)->mapState = MAP_STATE_MAPPED_GPU;
 
-        void *mapped = WEBGPU_INTERNAL_MapBufferRange((WebGPURenderer *)device, (WebGPUBufferContainer *)transferBuffer, 0, -1);
-        if (mapped != NULL && ((WebGPUBufferContainer *)transferBuffer)->pendingRepackCount > 0) {
-            return WEBGPU_INTERNAL_ApplyDownloadRepacks((WebGPURenderer *)device, (WebGPUBufferContainer *)transferBuffer, mapped);
-        }
-        return mapped;
+        return WEBGPU_INTERNAL_MapBufferRange((WebGPURenderer *)device, (WebGPUBufferContainer *)transferBuffer, 0, -1);
     }
 }
 
 static void WEBGPU_UnmapTransferBuffer(SDL_GPURenderer *device, SDL_GPUTransferBuffer *transferBuffer)
 {
-    if (((WebGPUBufferContainer *)transferBuffer)->mapState == MAP_STATE_MAPPED_CPU) {
-        // Yeah we don't actually have to do anything.
-    } else {
+    if (((WebGPUBufferContainer *)transferBuffer)->mapState == MAP_STATE_MAPPED_GPU) {
         wgpuBufferUnmap(((WebGPUBufferContainer *)transferBuffer)->activeBuffer->buffer);
     }
+    // Pseudo-mapped and shadow-mapped buffers hold nothing on the GPU side.
 }
 
 static void WEBGPU_INTERNAL_CopyBufferToBuffer(WGPUCommandEncoder encoder, WebGPUBufferContainer *sourceBuf,
@@ -5585,9 +5607,10 @@ static void WEBGPU_DownloadFromTexture(SDL_GPUCommandBuffer *commandBuffer, cons
     Uint32 bytesPerRowDest = BytesPerRow(pixelsPerRowDest, texture->format);
     Uint32 blockRowsPerLayerDest = (rowsPerLayerDest + blockHeight - 1) / blockHeight;
 
-    // WebGPU can write the app layout directly only with 256-byte-aligned rows and a texel-block-aligned offset.
+    // WebGPU can write the app layout directly only with 256-byte-aligned rows and a texel-block-aligned offset,
+    // and only while no earlier download into this buffer is still waiting to be repacked (order would flip).
     Uint32 offsetAlignment = (IsDepthFormat(texture->format) || IsStencilFormat(texture->format)) ? 4 : texelBlockSize;
-    bool direct = bytesPerRowDest % 256 == 0 && destination->offset % offsetAlignment == 0;
+    bool direct = bytesPerRowDest % 256 == 0 && destination->offset % offsetAlignment == 0 && container->activeBuffer->pendingRepackCount == 0;
 
     WGPUTexelCopyTextureInfo sourceInfo = {
         .aspect = WGPUTextureAspect_All,
@@ -5606,7 +5629,7 @@ static void WEBGPU_DownloadFromTexture(SDL_GPUCommandBuffer *commandBuffer, cons
         Uint32 paddedBytesPerRow = ALIGN_VALUE(bytesPerRow, 256);
         WebGPUBuffer *staging = WEBGPU_INTERNAL_CreateBuffer(cmdBuf->renderer, paddedBytesPerRow * blockRowsPerLayer * layerCount, 0,
                                                              WEBGPU_BUFFER_TYPE_TRANSFER_DOWNLOAD, "Padded Texture Download Buffer");
-        WebGPUTextureDownloadRepack repack = {
+        WebGPUDownloadRepack repack = {
             .staging = staging,
             .destinationOffset = destination->offset,
             .destinationBytesPerRow = bytesPerRowDest,
@@ -5616,8 +5639,8 @@ static void WEBGPU_DownloadFromTexture(SDL_GPUCommandBuffer *commandBuffer, cons
             .blockRowsPerLayer = blockRowsPerLayer,
             .layerCount = layerCount,
         };
-        WEBGPU_INTERNAL_InsertElementIntoArray(container->pendingRepacks, container->pendingRepackCapacity,
-                                               container->pendingRepackCount, WebGPUTextureDownloadRepack, repack);
+        WEBGPU_INTERNAL_InsertElementIntoArray(container->activeBuffer->pendingRepacks, container->activeBuffer->pendingRepackCapacity,
+                                               container->activeBuffer->pendingRepackCount, WebGPUDownloadRepack, repack);
 
         destInfo = (WGPUTexelCopyBufferInfo){
             .buffer = staging->buffer,
@@ -5780,9 +5803,30 @@ static bool WEBGPU_SupportsSampleCount(SDL_GPURenderer *driverData, SDL_GPUTextu
 static void WEBGPU_DownloadFromBuffer(SDL_GPUCommandBuffer *commandBuffer, const SDL_GPUBufferRegion *source, const SDL_GPUTransferBufferLocation *destination)
 {
     WebGPUCommandBuffer *cmdBuf = (WebGPUCommandBuffer *)commandBuffer;
-    WEBGPU_INTERNAL_CopyBufferToBuffer(cmdBuf->encoder, (WebGPUBufferContainer *)source->buffer, source->offset,
-                                       (WebGPUBufferContainer *)destination->transfer_buffer, destination->offset,
-                                       ALIGN_VALUE(source->size, 4));
+    WebGPUBuffer *target = ((WebGPUBufferContainer *)destination->transfer_buffer)->activeBuffer;
+    Uint32 size = ALIGN_VALUE(source->size, 4);
+
+    if (target->pendingRepackCount == 0) {
+        WEBGPU_INTERNAL_CopyBufferToBuffer(cmdBuf->encoder, (WebGPUBufferContainer *)source->buffer, source->offset,
+                                           (WebGPUBufferContainer *)destination->transfer_buffer, destination->offset, size);
+        return;
+    }
+
+    // An earlier texture download into this buffer is waiting to be repacked; stage this copy so it lands after it.
+    WebGPUBuffer *staging = WEBGPU_INTERNAL_CreateBuffer(cmdBuf->renderer, size, 0, WEBGPU_BUFFER_TYPE_TRANSFER_DOWNLOAD, "Ordered Buffer Download Buffer");
+    wgpuCommandEncoderCopyBufferToBuffer(cmdBuf->encoder, ((WebGPUBufferContainer *)source->buffer)->activeBuffer->buffer, source->offset, staging->buffer, 0, size);
+
+    WebGPUDownloadRepack repack = {
+        .staging = staging,
+        .destinationOffset = destination->offset,
+        .destinationBytesPerRow = source->size,
+        .destinationBlockRowsPerLayer = 1,
+        .bytesPerRow = source->size,
+        .paddedBytesPerRow = size,
+        .blockRowsPerLayer = 1,
+        .layerCount = 1,
+    };
+    WEBGPU_INTERNAL_InsertElementIntoArray(target->pendingRepacks, target->pendingRepackCapacity, target->pendingRepackCount, WebGPUDownloadRepack, repack);
 }
 
 static bool WEBGPU_SetAllowedFramesInFlight(SDL_GPURenderer *driverData, Uint32 allowedFramesInFlight)

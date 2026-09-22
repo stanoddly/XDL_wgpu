@@ -75,6 +75,13 @@ static bool ClearAndDownload(SDL_GPUDevice *device, SDL_GPUTextureFormat format,
     SDL_memcpy(out_pixels, mapped, byte_count);
     SDL_UnmapGPUTransferBuffer(device, transfer);
 
+    // A second map must see the same bytes.
+    mapped = SDL_MapGPUTransferBuffer(device, transfer, false);
+    if (!mapped || SDL_memcmp(out_pixels, mapped, byte_count) != 0) {
+        return SDL_SetError("second map differs from the first");
+    }
+    SDL_UnmapGPUTransferBuffer(device, transfer);
+
     SDL_ReleaseGPUTransferBuffer(device, transfer);
     SDL_ReleaseGPUTexture(device, texture);
     return true;
