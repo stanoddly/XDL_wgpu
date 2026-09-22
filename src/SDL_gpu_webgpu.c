@@ -956,6 +956,8 @@ typedef struct WebGPUDownloadRepack
 {
     WebGPUBuffer *target;
     WebGPUBuffer *staging;
+    // Leading bytes in the staging buffer to skip: buffer copies have to start 4-byte aligned.
+    Uint32 stagingOffset;
     Uint32 destinationOffset;
     Uint32 destinationBytesPerRow;
     Uint32 destinationBlockRowsPerLayer;
@@ -4371,7 +4373,7 @@ static void *WEBGPU_INTERNAL_ApplyDownloadRepacks(WebGPURenderer *renderer, WebG
                         SDL_LogError(SDL_LOG_CATEGORY_GPU, "Download does not fit in the transfer buffer; truncating");
                         break;
                     }
-                    SDL_memcpy((Uint8 *)container->downloadShadow + destinationOffset, source + (layer * repack->blockRowsPerLayer + row) * repack->paddedBytesPerRow, repack->bytesPerRow);
+                    SDL_memcpy((Uint8 *)container->downloadShadow + destinationOffset, source + repack->stagingOffset + (layer * repack->blockRowsPerLayer + row) * repack->paddedBytesPerRow, repack->bytesPerRow);
                 }
             }
             wgpuBufferUnmap(repack->staging->buffer);
@@ -5819,23 +5821,27 @@ static void WEBGPU_DownloadFromBuffer(SDL_GPUCommandBuffer *commandBuffer, const
     WebGPUCommandBuffer *cmdBuf = (WebGPUCommandBuffer *)commandBuffer;
     WebGPUBuffer *sourceBuffer = ((WebGPUBufferContainer *)source->buffer)->activeBuffer;
     WebGPUBuffer *target = ((WebGPUBufferContainer *)destination->transfer_buffer)->activeBuffer;
-    Uint32 size = ALIGN_VALUE(source->size, 4);
 
-    WebGPUBuffer *staging = WEBGPU_INTERNAL_CreateBuffer(cmdBuf->renderer, size, 0, WEBGPU_BUFFER_TYPE_TRANSFER_DOWNLOAD, "Buffer Download Staging Buffer");
+    // CopyBufferToBuffer needs a 4-byte-aligned offset and size, so copy the enclosing aligned range and trim on the CPU.
+    Uint32 alignedOffset = source->offset & ~3u;
+    Uint32 alignedSize = ALIGN_VALUE(source->offset + source->size, 4) - alignedOffset;
+
+    WebGPUBuffer *staging = WEBGPU_INTERNAL_CreateBuffer(cmdBuf->renderer, alignedSize, 0, WEBGPU_BUFFER_TYPE_TRANSFER_DOWNLOAD, "Buffer Download Staging Buffer");
     WebGPUDownloadRepack repack = {
         .target = target,
         .staging = staging,
+        .stagingOffset = source->offset - alignedOffset,
         .destinationOffset = destination->offset,
         .destinationBytesPerRow = source->size,
         .destinationBlockRowsPerLayer = 1,
         .bytesPerRow = source->size,
-        .paddedBytesPerRow = size,
+        .paddedBytesPerRow = alignedSize,
         .blockRowsPerLayer = 1,
         .layerCount = 1,
     };
     WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->queuedRepacks, cmdBuf->queuedRepackCapacity, cmdBuf->queuedRepackCount, WebGPUDownloadRepack, repack);
 
-    wgpuCommandEncoderCopyBufferToBuffer(cmdBuf->encoder, sourceBuffer->buffer, source->offset, staging->buffer, 0, size);
+    wgpuCommandEncoderCopyBufferToBuffer(cmdBuf->encoder, sourceBuffer->buffer, alignedOffset, staging->buffer, 0, alignedSize);
 
     WEBGPU_INTERNAL_TrackBuffer(cmdBuf, sourceBuffer);
     WEBGPU_INTERNAL_TrackBuffer(cmdBuf, target);
