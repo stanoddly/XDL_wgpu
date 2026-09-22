@@ -3,7 +3,7 @@ Copyright (C) 2026 Stan
 
 Portions of this software are derived from Simple DirectMedia Layer
 Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
-and from SDL_wgpu
+and from the original WebGPU backend in SDL_wgpu
 Copyright (C) 2025-2026 The Stickmahn <thestickmahn@proton.me>
 
 This software is provided 'as-is', without any express or implied

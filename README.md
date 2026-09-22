@@ -4,7 +4,7 @@ A WebGPU implementation of SDL3's GPU API (`SDL_GPU*`) for `wasm32-emscripten`, 
 
 Stock SDL3 has no browser GPU backend: on Emscripten `SDL_GetNumGPUDrivers()` returns 0 and `SDL_CreateGPUDevice()` fails. `libXDL_wgpu.a` defines every public `SDL_GPU*` function on top of the [emdawnwebgpu](https://github.com/google/dawn/blob/main/src/emdawnwebgpu/README.md) port. Your application keeps stock SDL and its existing calls; native platforms are untouched.
 
-The backend is `src/SDL_gpu_webgpu.c`, written by [The Stickmahn](https://github.com/TheeStickmahn) in [TheeStickmahn/SDL_wgpu](https://github.com/TheeStickmahn/SDL_wgpu) (a fork of SDL) and taken from [stanoddly/SDL_wgpu](https://github.com/stanoddly/SDL_wgpu) at commit a85f6ce6c. The same backend is under review upstream in [libsdl-org/SDL#16020](https://github.com/libsdl-org/SDL/pull/16020). This repository is a standalone library, not a fork of SDL; it does not track either fork.
+The backend is `src/SDL_gpu_webgpu.c`: the original WebGPU backend by [The Stickmahn](https://github.com/TheeStickmahn) ([TheeStickmahn/SDL_wgpu](https://github.com/TheeStickmahn/SDL_wgpu), a fork of SDL), with substantial further changes by Stan (stanoddly), adapted here to build outside the SDL tree. The same backend is under review upstream in [libsdl-org/SDL#16020](https://github.com/libsdl-org/SDL/pull/16020). This repository is a standalone library, not a fork of SDL and not tracking one.
 
 ## Link order rule
 
@@ -139,24 +139,24 @@ Build the library with the same exception flags as the runtime (`-DXDL_EMSCRIPTE
 |---|---|
 | `include/XDL_wgpu.h` | `SDL_GPU_SHADERFORMAT_WGSL` and the WebGPU device-creation properties |
 | `src/SDL_gpu.c`, `src/SDL_sysgpu.h` | SDL 3.4.16's GPU front end; backend table is `{ &WebGPUDriver, NULL }`, WGSL format mapped to its property |
-| `src/SDL_gpu_webgpu.c` | The WebGPU backend from SDL_wgpu, adapted to the port header and the pinned vtable (see [Changes to the backend](#changes-to-the-backend)) |
-| `src/SDL_wgpu_surface.c` | `WGPUSurface` from the window's Emscripten canvas selector |
+| `src/SDL_gpu_webgpu.c` | The WebGPU backend, adapted to the port header and the pinned vtable (see [Changes to the backend](#changes-to-the-backend)) |
+| `src/XDL_wgpu_surface.c` | `WGPUSurface` from the window's Emscripten canvas selector |
 | `test/` | Smoke test page |
 | `tools/` | Emscripten environment and test runner scripts |
 | `external/SDL` | SDL submodule at `release-3.4.16` |
 
 ## Changes to the backend
 
-Relative to `src/gpu/webgpu/SDL_gpu_webgpu.c` in stanoddly/SDL_wgpu at a85f6ce6c:
+Relative to the backend as copied into this repository:
 
 1. Includes the Emscripten port's `<webgpu/webgpu.h>` and this repository's `XDL_wgpu.h` instead of the fork's bundled `webgpu.h` and SDL header additions.
-2. Surface creation calls `XDL_WGPU_CreateSurface()` (in `src/SDL_wgpu_surface.c`) instead of the fork's `SDL_WGPU_CreateSurface()` video-backend hook, and sets `selector.length`, which the fork leaves unset ([SDL_wgpu#7](https://github.com/stanoddly/SDL_wgpu/issues/7)).
+2. Surface creation calls `XDL_WGPU_CreateSurface()` (in `src/XDL_wgpu_surface.c`) instead of the `SDL_WGPU_CreateSurface()` video-backend hook, which does not exist outside the fork, and sets `selector.length`, which the original leaves unset.
 3. The four OpenXR vtable functions are removed, because SDL 3.4.16's `SDL_sysgpu.h` has no XR slots, and the `WGPUFeatureName_SubgroupSizeControl` case is dropped, because the pinned port header does not declare it.
 4. `WEBGPU_PrepareDriver()` requires `SDL_PROP_GPU_DEVICE_CREATE_SHADERS_WGSL_BOOLEAN`, like the other SDL backends require their own shader format.
-5. `WEBGPU_DownloadFromTexture()` was rewritten: it passed `source->layer` as `depthOrArrayLayers` (0 for 2D, copying nothing), ignored `mip_level` and `layer`, ignored `pixels_per_row` / `rows_per_layer` and wrote 256-byte-padded rows into the app's buffer ([SDL_wgpu#6](https://github.com/stanoddly/SDL_wgpu/issues/6)), and did not reference-count the resources it used. Downloads now copy into a staging buffer and are repacked into the app's layout when the transfer buffer is mapped; `WEBGPU_DownloadFromBuffer()` goes through the same path so downloads replay in submission order.
+5. `WEBGPU_DownloadFromTexture()` was rewritten: it passed `source->layer` as `depthOrArrayLayers` (0 for 2D, copying nothing), ignored `mip_level` and `layer`, ignored `pixels_per_row` / `rows_per_layer` and wrote 256-byte-padded rows into the app's buffer, and did not reference-count the resources it used. Downloads now copy into a staging buffer and are repacked into the app's layout when the transfer buffer is mapped; `WEBGPU_DownloadFromBuffer()` goes through the same path so downloads replay in submission order.
 
 ## License
 
 zlib, the same as SDL (see `LICENSE`).
 
-`src/SDL_gpu.c`, `src/SDL_sysgpu.h` and `src/SDL_gpu_webgpu.c` are derived works and keep their notices: the first two are copied from [libsdl-org/SDL](https://github.com/libsdl-org/SDL), and the backend was written by The Stickmahn in [TheeStickmahn/SDL_wgpu](https://github.com/TheeStickmahn/SDL_wgpu) and taken from [stanoddly/SDL_wgpu](https://github.com/stanoddly/SDL_wgpu).
+`src/SDL_gpu.c`, `src/SDL_sysgpu.h` and `src/SDL_gpu_webgpu.c` are derived works and keep their notices. The first two are copied from [libsdl-org/SDL](https://github.com/libsdl-org/SDL). `src/SDL_gpu_webgpu.c` is the original WebGPU backend by The Stickmahn ([TheeStickmahn/SDL_wgpu](https://github.com/TheeStickmahn/SDL_wgpu)) with substantial further changes by Stan (stanoddly); it keeps its upstream file name so it can still be diffed against the original and against [libsdl-org/SDL#16020](https://github.com/libsdl-org/SDL/pull/16020).

@@ -2,8 +2,11 @@
   Simple DirectMedia Layer
   Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
-  WebGPU backend
+  Original WebGPU backend
   Copyright (C) 2025-2026 The Stickmahn <thestickmahn@proton.me>
+
+  Further changes
+  Copyright (C) 2026 Stan (stanoddly)
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -22,8 +25,7 @@
   3. This notice may not be removed or altered from any source distribution.
 */
 
-// Taken from TheeStickmahn/SDL_wgpu via stanoddly/SDL_wgpu at a85f6ce6c and adapted to build outside the SDL tree.
-// See README.md for the list of changes.
+// Adapted from the original WebGPU backend to build outside the SDL tree. See README.md for the list of changes.
 
 // TODO:
 // - Clean up this code base.

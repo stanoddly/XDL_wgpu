@@ -25,7 +25,7 @@ add_subdirectory("${XDL_SDL_SOURCE_DIR}" external/SDL EXCLUDE_FROM_ALL)
 separate_arguments(xdl_emscripten_flags NATIVE_COMMAND "${XDL_EMSCRIPTEN_FLAGS}")
 set(xdl_port_flags --use-port=emdawnwebgpu)
 
-add_library(XDL_wgpu STATIC src/SDL_gpu.c src/SDL_gpu_webgpu.c src/SDL_wgpu_surface.c)
+add_library(XDL_wgpu STATIC src/SDL_gpu.c src/SDL_gpu_webgpu.c src/XDL_wgpu_surface.c)
 set_target_properties(XDL_wgpu PROPERTIES OUTPUT_NAME XDL_wgpu PREFIX lib)
 
 # Compile exactly like an SDL-internal source file: same generated SDL_build_config.h, same private include path and defines.
