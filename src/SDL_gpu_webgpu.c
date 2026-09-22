@@ -47,11 +47,16 @@
 #include "XDL_wgpu.h"
 #include <webgpu/webgpu.h>
 
+#ifdef SDL_PLATFORM_EMSCRIPTEN
+#include <emscripten.h>
+#endif
+
 extern WGPUSurface XDL_WGPU_CreateSurface(SDL_Window *window, WGPUInstance instance);
 
 #define WINDOW_PROPERTY_DATA                           "SDL.internal.gpu.webgpu.data"
 #define DEFAULT_BINDGROUP_EXPIRY                       10000
 #define FORCIBLY_DESTROY_QUEUED_DESTROY_AFTER_N_FAILED 10000
+#define DESTROY_DEVICE_DRAIN_TIMEOUT_NS                SDL_NS_PER_SECOND
 
 // Disable pseudo-mapping. Useful for debugging upload errors.
 #define DEV_DISABLE_TRANSFER_BUFFER_PSEUDO_MAPPING false
@@ -2672,6 +2677,24 @@ static void WEBGPU_INTERNAL_CheckSubmittedCommandBuffers(WebGPURenderer *rendere
     renderer->submittedCommandBuffers = notCompleted;
 }
 
+// Retires every submission without waiting for its fence, for a device whose futures may never complete.
+// The fences are leaked on purpose, since a late callback could still write to them.
+static void WEBGPU_INTERNAL_AbandonSubmittedCommandBuffers(WebGPURenderer *renderer)
+{
+    SDL_LockMutex(renderer->submittingCommandBufferLock);
+
+    for (int i = 0; i < renderer->submittedCommandBufferCount; i++) {
+        WebGPUSubmittedCommandBuffer *current = renderer->submittedCommandBuffers[i];
+        if (current != NULL) {
+            current->fence = NULL;
+            WEBGPU_INTERNAL_QueueSubmittedCommandBufferForRelease(renderer, current);
+        }
+    }
+    renderer->submittedCommandBufferCount = 0;
+
+    SDL_UnlockMutex(renderer->submittingCommandBufferLock);
+}
+
 static void WEBGPU_INTERNAL_ReleaseTextureContainer(WebGPURenderer *renderer, WebGPUTextureContainer *container);
 static void WEBGPU_INTERNAL_ReleaseTexture(WebGPURenderer *renderer, WebGPUTexture *texture);
 static void WEBGPU_INTERNAL_ReleaseSampler(WebGPURenderer *renderer, WebGPUSampler *sampler);
@@ -2696,7 +2719,8 @@ static void WEBGPU_INTERNAL_ReleaseTrackedResources(WebGPUSubmittedCommandBuffer
     submitted->usedBufferCount = submitted->usedBufferCapacity = 0;
 }
 
-static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer)
+// forceAll releases every queued resource even while it is still referenced; only a device being destroyed should ask for it.
+static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool forceAll)
 {
     WebGPUQueuedDestroy **newQueuedDestroys = NULL;
     Uint32 newQueuedDestroysCapacity = 0;
@@ -2717,7 +2741,7 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer)
             WebGPUQueuedDestroy *current = renderer->queuedDestroys[i];
 
             int currentRefCount = 0;
-            bool forciblyDestroy = false;
+            bool forciblyDestroy = forceAll;
             bool wasReleased = false;
 
             if (current == NULL) {
@@ -3470,7 +3494,7 @@ static bool WEBGPU_AcquireSwapchainTexture(SDL_GPUCommandBuffer *commandBuffer, 
 
     // Reap finished submissions first, otherwise a caller that only ever uses the
     // non-blocking acquire hits the frames-in-flight cap and never recovers.
-    WEBGPU_INTERNAL_HandlePendingDestroys(cmdBuf->renderer);
+    WEBGPU_INTERNAL_HandlePendingDestroys(cmdBuf->renderer, false);
 
     if (cmdBuf->renderer->submittedCommandBufferCount >= cmdBuf->renderer->maxFramesInFlight) {
         *swapchainTexture = NULL;
@@ -4875,7 +4899,7 @@ static bool WEBGPU_WaitAndAcquireSwapchainTexture(SDL_GPUCommandBuffer *command_
     bool result = WEBGPU_AcquireSwapchainTexture(command_buffer, window, swapchain_texture, swapchain_texture_width, swapchain_texture_height);
 
     while (*swapchain_texture == NULL) {
-        WEBGPU_INTERNAL_HandlePendingDestroys(((WebGPUCommandBuffer *)command_buffer)->renderer);
+        WEBGPU_INTERNAL_HandlePendingDestroys(((WebGPUCommandBuffer *)command_buffer)->renderer, false);
         SDL_DelayNS(15);
 
         result = WEBGPU_AcquireSwapchainTexture(command_buffer, window, swapchain_texture, swapchain_texture_width, swapchain_texture_height);
@@ -5471,7 +5495,7 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
     SDL_LockMutex(renderer->submittingCommandBufferLock);
 
     if (isMainThread) {
-        WEBGPU_INTERNAL_HandlePendingDestroys(renderer);
+        WEBGPU_INTERNAL_HandlePendingDestroys(renderer, false);
         WEBGPU_INTERNAL_UploadQueuedUniformData(wrapper);
     }
 
@@ -5598,8 +5622,38 @@ static void WEBGPU_DestroyDevice(SDL_GPUDevice *device)
 
     WEBGPU_INTERNAL_ReleaseBlitResources(renderer);
 
+    // Resources still used by a submission can only be freed once that submission completes, so wait for the queue to drain.
+    // On Emscripten a submission completes only when the browser event loop runs. SDL_DelayNS yields to it under Asyncify or
+    // JSPI; without them nothing can yield here, and whatever is still pending after the first pass would never complete.
+    // A lost device may never complete its submissions either, and a healthy one gets DESTROY_DEVICE_DRAIN_TIMEOUT_NS.
+#ifdef SDL_PLATFORM_EMSCRIPTEN
+    bool canWaitForSubmissions = emscripten_has_asyncify() && SDL_GetHintBoolean(SDL_HINT_EMSCRIPTEN_ASYNCIFY, true);
+#else
+    bool canWaitForSubmissions = true;
+#endif
+    Uint64 drainDeadline = SDL_GetTicksNS() + DESTROY_DEVICE_DRAIN_TIMEOUT_NS;
+
+    WEBGPU_INTERNAL_HandlePendingDestroys(renderer, false);
     while (renderer->queuedDestroyCount > 0 || renderer->submittedCommandBufferCount > 0) {
-        WEBGPU_INTERNAL_HandlePendingDestroys(renderer);
+        if (!canWaitForSubmissions || SDL_GetAtomicInt(&renderer->deviceLost) || SDL_GetTicksNS() >= drainDeadline) {
+            if (renderer->submittedCommandBufferCount > 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Destroying the device with %u incomplete submissions; their fences are leaked.", renderer->submittedCommandBufferCount);
+                WEBGPU_INTERNAL_AbandonSubmittedCommandBuffers(renderer);
+            }
+
+            // Releasing a submission only drops its references, and the resources it held are freed on a later pass,
+            // so keep passing while that frees something. Whatever is still queued afterwards is forced out.
+            Uint32 queuedBeforePass;
+            do {
+                queuedBeforePass = renderer->queuedDestroyCount;
+                WEBGPU_INTERNAL_HandlePendingDestroys(renderer, false);
+            } while (renderer->queuedDestroyCount > 0 && renderer->queuedDestroyCount < queuedBeforePass);
+            WEBGPU_INTERNAL_HandlePendingDestroys(renderer, true);
+            break;
+        }
+
+        SDL_DelayNS(100);
+        WEBGPU_INTERNAL_HandlePendingDestroys(renderer, false);
     }
 
     // Destroying mutexes
