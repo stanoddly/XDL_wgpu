@@ -807,6 +807,11 @@ typedef struct WebGPURenderer
     SDL_Mutex *registeringQueuedDestroyLock;
     SDL_Mutex *submittingCommandBufferLock;
     SDL_Mutex *creatingWebGPUResourceLock;
+    SDL_Mutex *claimingWindowLock;
+
+    WebGPUWindowData **claimedWindows;
+    Uint32 claimedWindowCount;
+    Uint32 claimedWindowCapacity;
 
     // The ID of the thread which created this renderer.
     // This is currently only used for upload transfer buffer mapping / writing.
@@ -837,6 +842,7 @@ struct WebGPUWindowData
 {
     SDL_Window *window;
     WebGPURenderer *renderer;
+    int refcount;
 
     SDL_GPUSwapchainComposition swapchainComposition;
     SDL_GPUPresentMode presentMode;
@@ -3445,21 +3451,69 @@ static void WEBGPU_ReleaseSampler(SDL_GPURenderer *device, SDL_GPUSampler *sampl
 // forward decl
 static bool WEBGPU_SupportsSwapchainComposition(SDL_GPURenderer *driverData, SDL_Window *window, SDL_GPUSwapchainComposition swapchainComposition);
 static SDL_GPUTextureFormat WEBGPU_GetSwapchainTextureFormat(SDL_GPURenderer *device, SDL_Window *window);
+static void WEBGPU_ReleaseWindow(SDL_GPURenderer *driverData, SDL_Window *window);
+
+// Cleanup of the window property, so it runs both when the claim is released and when SDL_DestroyWindow destroys a window
+// that is still claimed. It must not touch the window, which may be mid-destruction.
+static void SDLCALL WEBGPU_INTERNAL_DestroyWindowData(void *userdata, void *value)
+{
+    WebGPUWindowData *windowData = (WebGPUWindowData *)value;
+    WebGPURenderer *renderer = windowData->renderer;
+
+    // FIXME: This should be done in the video subsystem!
+    wgpuSurfaceUnconfigure(windowData->surface);
+    wgpuSurfaceRelease(windowData->surface);
+
+    SDL_LockMutex(renderer->claimingWindowLock);
+    for (Uint32 i = 0; i < renderer->claimedWindowCount; i++) {
+        if (renderer->claimedWindows[i] == windowData) {
+            renderer->claimedWindows[i] = renderer->claimedWindows[renderer->claimedWindowCount - 1];
+            renderer->claimedWindowCount--;
+            break;
+        }
+    }
+    SDL_UnlockMutex(renderer->claimingWindowLock);
+
+    SDL_free(windowData);
+}
 
 static bool WEBGPU_ClaimWindow(SDL_GPURenderer *device, SDL_Window *window)
 {
-    WebGPUWindowData *windowData;
+    WebGPURenderer *renderer = (WebGPURenderer *)device;
     SDL_PropertiesID props = SDL_GetWindowProperties(window);
+    WebGPUWindowData *windowData = SDL_GetPointerProperty(props, WINDOW_PROPERTY_DATA, NULL);
+
+    if (windowData != NULL) {
+        if (windowData->renderer != renderer) {
+            return SDL_SetError("Window already claimed");
+        }
+        windowData->refcount++;
+        return true;
+    }
 
     windowData = (WebGPUWindowData *)SDL_calloc(1, sizeof(*windowData));
-    SDL_SetPointerProperty(props, WINDOW_PROPERTY_DATA, windowData);
-
     windowData->window = window;
+    windowData->refcount = 1;
     windowData->presentMode = SDL_GPU_PRESENTMODE_VSYNC,
     windowData->swapchainComposition = SDL_GPU_SWAPCHAINCOMPOSITION_SDR;
-    windowData->renderer = (WebGPURenderer *)device;
-    windowData->surface = XDL_WGPU_CreateSurface(window, windowData->renderer->instance);
+    windowData->renderer = renderer;
+    windowData->surface = XDL_WGPU_CreateSurface(window, renderer->instance);
     windowData->surfaceDirty = false;
+
+    if (windowData->surface == NULL) {
+        SDL_free(windowData);
+        return false;
+    }
+
+    SDL_LockMutex(renderer->claimingWindowLock);
+    WEBGPU_INTERNAL_InsertElementIntoArray(renderer->claimedWindows, renderer->claimedWindowCapacity, renderer->claimedWindowCount, WebGPUWindowData *, windowData);
+    SDL_UnlockMutex(renderer->claimingWindowLock);
+
+    // On failure this already ran the cleanup, which freed windowData.
+    if (!SDL_SetPointerPropertyWithCleanup(props, WINDOW_PROPERTY_DATA, windowData, WEBGPU_INTERNAL_DestroyWindowData, NULL)) {
+        return false;
+    }
+
     int w = 0;
     int h = 0;
 
@@ -3482,11 +3536,6 @@ static bool WEBGPU_ClaimWindow(SDL_GPURenderer *device, SDL_Window *window)
     };
 
     wgpuSurfaceConfigure(windowData->surface, &windowData->surfaceConfig);
-
-    if (windowData->surface == NULL) {
-        // TODO: I can't be bothered freeing everything
-        return false;
-    }
 
     return true;
 }
@@ -5609,6 +5658,7 @@ static void WEBGPU_INTERNAL_DestroyPartialRenderer(WebGPURenderer *renderer)
     SDL_DestroyMutex(renderer->registeringQueuedDestroyLock);
     SDL_DestroyMutex(renderer->submittingCommandBufferLock);
     SDL_DestroyMutex(renderer->creatingWebGPUResourceLock);
+    SDL_DestroyMutex(renderer->claimingWindowLock);
     SDL_DestroyHashTable(renderer->bindGroupHashTable);
     SDL_DestroyProperties(renderer->props);
     SDL_free(renderer);
@@ -5621,6 +5671,14 @@ static void WEBGPU_DestroyDevice(SDL_GPUDevice *device)
     renderer->destroyingSelf = true;
 
     SDL_LockMutex(renderer->destroyingSelfLock);
+
+    // Windows the app did not release would otherwise keep pointing at the freed renderer.
+    // Every window in the list is alive, because destroying a window removes it through the property cleanup.
+    while (renderer->claimedWindowCount > 0) {
+        WebGPUWindowData *windowData = renderer->claimedWindows[renderer->claimedWindowCount - 1];
+        windowData->refcount = 1;
+        WEBGPU_ReleaseWindow((SDL_GPURenderer *)renderer, windowData->window);
+    }
 
     for (int i = 0; i < 12; i++) {
         WEBGPU_INTERNAL_ReleaseBufferContainer(renderer, renderer->uniformBuffers[i]);
@@ -5666,6 +5724,7 @@ static void WEBGPU_DestroyDevice(SDL_GPUDevice *device)
     SDL_DestroyMutex(renderer->registeringQueuedDestroyLock);
     SDL_DestroyMutex(renderer->submittingCommandBufferLock);
     SDL_DestroyMutex(renderer->creatingWebGPUResourceLock);
+    SDL_DestroyMutex(renderer->claimingWindowLock);
 
     WEBGPU_INTERNAL_ReleaseWebGPUObjects(renderer);
 
@@ -5676,23 +5735,29 @@ static void WEBGPU_DestroyDevice(SDL_GPUDevice *device)
     SDL_DestroyMutex(renderer->destroyingSelfLock);
     SDL_free(renderer->blitPipelines);
     SDL_free(renderer->submittedCommandBuffers);
+    SDL_free(renderer->claimedWindows);
     SDL_free(renderer);
     SDL_free(device);
 }
 
 static void WEBGPU_ReleaseWindow(SDL_GPURenderer *driverData, SDL_Window *window)
 {
+    WebGPURenderer *renderer = (WebGPURenderer *)driverData;
     WebGPUWindowData *windowData = SDL_GetPointerProperty(window->props, WINDOW_PROPERTY_DATA, NULL);
     if (windowData == NULL) {
         return;
     }
+    if (windowData->renderer != renderer) {
+        SDL_SetError("Window not claimed by this device");
+        return;
+    }
+    if (windowData->refcount > 1) {
+        windowData->refcount--;
+        return;
+    }
 
-    // FIXME: This should be done in the video subsystem!
-    wgpuSurfaceUnconfigure(windowData->surface);
-    wgpuSurfaceRelease(windowData->surface);
+    // Runs WEBGPU_INTERNAL_DestroyWindowData.
     SDL_ClearProperty(window->props, WINDOW_PROPERTY_DATA);
-
-    SDL_free(windowData);
 }
 
 static void WEBGPU_INTERNAL_TrackBuffer(WebGPUCommandBuffer *cmdBuf, WebGPUBuffer *buffer)
@@ -6249,6 +6314,7 @@ static SDL_GPUDevice *WEBGPU_CreateDevice(bool debugMode, bool preferLowPower, S
     renderer->registeringQueuedDestroyLock = SDL_CreateMutex();
     renderer->submittingCommandBufferLock = SDL_CreateMutex();
     renderer->creatingWebGPUResourceLock = SDL_CreateMutex();
+    renderer->claimingWindowLock = SDL_CreateMutex();
 
     renderer->createdByThreadID = SDL_GetCurrentThreadID();
 
