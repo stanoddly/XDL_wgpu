@@ -108,6 +108,75 @@ static bool ClearAndDownload(SDL_GPUDevice *device, SDL_GPUTextureFormat format,
     return true;
 }
 
+// Uploads a width x height x depth RGBA8 3D texture from a transfer buffer whose slices are rows_per_layer rows apart,
+// with filler in the extra rows, and downloads it tightly packed to out_pixels.
+static bool UploadAndDownload3D(SDL_GPUDevice *device, Uint32 width, Uint32 height, Uint32 depth, Uint32 rows_per_layer, Uint8 *out_pixels)
+{
+    SDL_GPUTextureCreateInfo texture_info = {
+        .type = SDL_GPU_TEXTURETYPE_3D,
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = width,
+        .height = height,
+        .layer_count_or_depth = depth,
+        .num_levels = 1,
+    };
+    SDL_GPUTexture *texture = SDL_CreateGPUTexture(device, &texture_info);
+    if (!texture) {
+        return SDL_SetError("SDL_CreateGPUTexture: %s", SDL_GetError());
+    }
+
+    Uint32 row_bytes = width * 4;
+    Uint32 upload_bytes = row_bytes * rows_per_layer * depth;
+    SDL_GPUTransferBufferCreateInfo upload_info = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = upload_bytes };
+    SDL_GPUTransferBuffer *upload = SDL_CreateGPUTransferBuffer(device, &upload_info);
+    Uint32 download_bytes = row_bytes * height * depth;
+    SDL_GPUTransferBufferCreateInfo download_info = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = download_bytes };
+    SDL_GPUTransferBuffer *download = SDL_CreateGPUTransferBuffer(device, &download_info);
+    if (!upload || !download) {
+        return SDL_SetError("SDL_CreateGPUTransferBuffer: %s", SDL_GetError());
+    }
+
+    // Slice z is filled with byte z + 1 and the filler rows with 0xEE.
+    Uint8 *mapped = SDL_MapGPUTransferBuffer(device, upload, false);
+    if (!mapped) {
+        return SDL_SetError("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
+    }
+    SDL_memset(mapped, 0xEE, upload_bytes);
+    for (Uint32 z = 0; z < depth; z++) {
+        SDL_memset(mapped + z * rows_per_layer * row_bytes, (int)(z + 1), height * row_bytes);
+    }
+    SDL_UnmapGPUTransferBuffer(device, upload);
+
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(device);
+    SDL_GPUCopyPass *copy_pass = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureRegion region = { .texture = texture, .w = width, .h = height, .d = depth };
+    SDL_GPUTextureTransferInfo source = { .transfer_buffer = upload, .rows_per_layer = rows_per_layer };
+    SDL_UploadToGPUTexture(copy_pass, &source, &region, false);
+    SDL_GPUTextureTransferInfo destination = { .transfer_buffer = download };
+    SDL_DownloadFromGPUTexture(copy_pass, &region, &destination);
+    SDL_EndGPUCopyPass(copy_pass);
+
+    SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    if (!fence) {
+        return SDL_SetError("SDL_SubmitGPUCommandBufferAndAcquireFence: %s", SDL_GetError());
+    }
+    SDL_WaitForGPUFences(device, true, &fence, 1);
+    SDL_ReleaseGPUFence(device, fence);
+
+    mapped = SDL_MapGPUTransferBuffer(device, download, false);
+    if (!mapped) {
+        return SDL_SetError("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
+    }
+    SDL_memcpy(out_pixels, mapped, download_bytes);
+    SDL_UnmapGPUTransferBuffer(device, download);
+
+    SDL_ReleaseGPUTransferBuffer(device, upload);
+    SDL_ReleaseGPUTransferBuffer(device, download);
+    SDL_ReleaseGPUTexture(device, texture);
+    return true;
+}
+
 static bool PixelsAreUniform(const Uint8 *pixels, Uint32 count, Uint32 bytes_per_pixel)
 {
     for (Uint32 i = 1; i < count; i++) {
@@ -188,6 +257,21 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
         return SDL_APP_FAILURE;
     }
     SDL_Log("Readback %dx1 at offset 2: %u %u %u %u (uniform: %s)", TEST_WIDTH, offset_pixels[2], offset_pixels[3], offset_pixels[4], offset_pixels[5], PixelsAreUniform(offset_pixels + 2, TEST_WIDTH, 4) ? "yes" : "no");
+
+    // Slices one row apart more than their height: every slice after the first must skip the filler row.
+    static Uint8 volume_pixels[4 * 2 * 2 * 4];
+    if (!UploadAndDownload3D(state->device, 4, 2, 2, 3, volume_pixels)) {
+        SDL_Log("3D upload and download failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    bool slices_match = true;
+    for (Uint32 i = 0; i < sizeof(volume_pixels); i++) {
+        slices_match = slices_match && volume_pixels[i] == (i < sizeof(volume_pixels) / 2 ? 1 : 2);
+    }
+    SDL_Log("Upload 4x2x2 with rows_per_layer 3: slice 0 = %u, slice 1 = %u (match: %s)", volume_pixels[0], volume_pixels[sizeof(volume_pixels) / 2], slices_match ? "yes" : "no");
+    if (!slices_match) {
+        return SDL_APP_FAILURE;
+    }
 
     return SDL_APP_CONTINUE;
 }
