@@ -1716,6 +1716,8 @@ static void WEBGPU_INTERNAL_RequestDevice(WebGPURenderer *renderer, bool *succes
         }
     }
 
+    // Leak: under Asyncify, emdawnwebgpu tracks the device-lost future in its promise table but never exposes its ID,
+    // so the backend cannot forget it and every created device leaks one entry for the life of the page.
     deviceDesc.deviceLostCallbackInfo = (WGPUDeviceLostCallbackInfo){
         .callback = WEBGPU_INTERNAL_DeviceLostCallback,
         .mode = WGPUCallbackMode_AllowSpontaneous,
