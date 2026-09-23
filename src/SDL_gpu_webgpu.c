@@ -831,7 +831,6 @@ typedef struct WebGPURenderer
     bool destroyingSelf;
     bool preferLowPower;
     SDL_AtomicInt deviceLost;
-    bool ownsDevice;
 } WebGPURenderer;
 
 struct WebGPUWindowData
@@ -5580,11 +5579,10 @@ static void WEBGPU_INTERNAL_ReleaseWebGPUObjects(WebGPURenderer *renderer)
         wgpuQueueRelease(renderer->queue);
     }
     if (renderer->device != NULL) {
-        // FIXME: Releasing an SDL-created device leaks a bunch of memory each time!!! There's 100% some resource I'm not freeing.
         // For an adopted device this only drops the reference SDL took when adopting it.
-        if (!renderer->ownsDevice) {
-            wgpuDeviceRelease(renderer->device);
-        }
+        // For an SDL-created device it drops the last reference, which destroys the device and fires its device-lost callback
+        // right here, so neither callback can reach the renderer after it is freed.
+        wgpuDeviceRelease(renderer->device);
     }
     if (renderer->adapter != NULL) {
         wgpuAdapterRelease(renderer->adapter);
@@ -6308,7 +6306,6 @@ static SDL_GPUDevice *WEBGPU_CreateDevice(bool debugMode, bool preferLowPower, S
         renderer->device = externalDevice;
     } else {
         WEBGPU_INTERNAL_RequestDevice(renderer, &getDeviceSucceeded);
-        renderer->ownsDevice = true;
     }
 
     if (!renderer->device) {
