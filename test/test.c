@@ -23,6 +23,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #include <XDL_wgpu.h>
+#include <emscripten.h>
 
 #define TEST_WIDTH 64
 #define TEST_HEIGHT 4
@@ -35,7 +36,14 @@ typedef struct AppState
     SDL_Window *window;
     SDL_GPUDevice *device;
     int frames_submitted;
+    int futures_after_init;
 } AppState;
+
+// Promises emdawnwebgpu keeps for futures under Asyncify; each one the backend does not drop stays for the life of the page.
+static int CountTrackedFutures(void)
+{
+    return EM_ASM_INT({ return Object.keys(WebGPU.Internals.futures).length; });
+}
 
 static Uint32 BytesPerPixel(SDL_GPUTextureFormat format)
 {
@@ -299,6 +307,9 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
         return SDL_APP_FAILURE;
     }
 
+    SDL_WaitForGPUIdle(state->device);
+    state->futures_after_init = CountTrackedFutures();
+
     return SDL_APP_CONTINUE;
 }
 
@@ -328,7 +339,14 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
     state->frames_submitted++;
     SDL_Log("Frame %d submitted", state->frames_submitted);
-    return state->frames_submitted < FRAMES_TO_SUBMIT ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;
+    if (state->frames_submitted < FRAMES_TO_SUBMIT) {
+        return SDL_APP_CONTINUE;
+    }
+
+    SDL_WaitForGPUIdle(state->device);
+    int futures_after_frames = CountTrackedFutures();
+    SDL_Log("Tracked futures: %d after init, %d after %d frames", state->futures_after_init, futures_after_frames, FRAMES_TO_SUBMIT);
+    return futures_after_frames <= state->futures_after_init ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
 }
 
 SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)

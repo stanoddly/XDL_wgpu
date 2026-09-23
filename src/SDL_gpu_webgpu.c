@@ -830,8 +830,6 @@ typedef struct WebGPURenderer
     // Set to -1 to disable pruning, and 0 to instantly free it.
     int bindGroupsExpireAfter;
 
-    WebGPUFence *queueDoneFence;
-
     bool debugMode;
     bool destroyingSelf;
     bool preferLowPower;
@@ -1609,6 +1607,12 @@ static void WEBGPU_INTERNAL_QueueBindGroupForRelease(WebGPURenderer *renderer, W
     WEBGPU_INTERNAL_RegisterQueuedDestroy(renderer, destroy);
 }
 
+// Under Asyncify, emdawnwebgpu keeps a promise for every future until a wgpuInstanceWaitAny with a timeout consumes it.
+// The backend only polls with a zero timeout, so it drops that promise itself once the future has completed.
+EM_JS(void, WEBGPU_INTERNAL_ForgetFuture, (double futureId), {
+    delete WebGPU.Internals.futures[futureId];
+});
+
 static void WEBGPU_INTERNAL_RequestAdapter(WebGPURenderer *renderer, bool *success)
 {
     WGPURequestAdapterOptions adapterReqOptions = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
@@ -1632,6 +1636,7 @@ static void WEBGPU_INTERNAL_RequestAdapter(WebGPURenderer *renderer, bool *succe
         wgpuInstanceWaitAny(renderer->instance, 1, &waitInfo, 0);
         SDL_DelayNS(100);
     }
+    WEBGPU_INTERNAL_ForgetFuture((double)future.id);
 }
 
 static bool WEBGPU_INTERNAL_DeviceHasRequiredFeatures(WGPUDevice device)
@@ -1746,6 +1751,7 @@ static void WEBGPU_INTERNAL_RequestDevice(WebGPURenderer *renderer, bool *succes
         wgpuInstanceWaitAny(renderer->instance, 1, &waitInfo, 0);
         SDL_DelayNS(100);
     }
+    WEBGPU_INTERNAL_ForgetFuture((double)future.id);
 
     wgpuSupportedFeaturesFreeMembers(supportedFeatures);
     SDL_free(features);
@@ -1928,22 +1934,6 @@ static WebGPUFence *WEBGPU_INTERNAL_CreateFenceFromFuture(WGPUFuture future)
     return fence;
 }
 
-static void WEBGPU_INTERNAL_ReregisterFence(WGPUQueue queue, WebGPUFence *fence)
-{
-    if (fence == NULL) {
-        return;
-    }
-
-    SDL_SetAtomicInt(&fence->status, 0);
-    fence->future.future = wgpuQueueOnSubmittedWorkDone(queue, (WGPUQueueWorkDoneCallbackInfo){
-                                                                   .callback = WEBGPU_INTERNAL_FenceCallback,
-                                                                   .mode = WGPUCallbackMode_WaitAnyOnly,
-                                                                   .nextInChain = NULL,
-                                                                   .userdata1 = fence,
-                                                                   .userdata2 = NULL,
-                                                               });
-}
-
 static bool WEBGPU_INTERNAL_QueryFence(WebGPURenderer *renderer, WebGPUFence *fence)
 {
     if (fence != NULL) {
@@ -1953,6 +1943,9 @@ static bool WEBGPU_INTERNAL_QueryFence(WebGPURenderer *renderer, WebGPUFence *fe
         // Despite its name, WaitAny isn't actually blocking unless the TimedWaitAny instance feature is enabled,
         // and you give a value to the timeoutNS argument.
         wgpuInstanceWaitAny(renderer->instance, 1, &fence->future, 0);
+        if (fence->future.completed) {
+            WEBGPU_INTERNAL_ForgetFuture((double)fence->future.future.id);
+        }
 
         SDL_SetAtomicInt(&fence->status, fence->future.completed);
 
@@ -1994,7 +1987,15 @@ static bool WEBGPU_WaitForFences(SDL_GPURenderer *device, bool waitAll, SDL_GPUF
 
 static bool WEBGPU_Wait(SDL_GPURenderer *driverData)
 {
-    return WEBGPU_WaitForFences(driverData, true, (SDL_GPUFence **)&((WebGPURenderer *)driverData)->queueDoneFence, 1);
+    WebGPURenderer *renderer = (WebGPURenderer *)driverData;
+
+    SDL_LockMutex(renderer->submittingCommandBufferLock);
+    for (Uint32 i = 0; i < renderer->submittedCommandBufferCount; i++) {
+        WEBGPU_INTERNAL_WaitForFences(renderer, true, &renderer->submittedCommandBuffers[i]->fence, 1);
+    }
+    SDL_UnlockMutex(renderer->submittingCommandBufferLock);
+
+    return true;
 }
 
 // -- WGSL resource declaration parser --
@@ -5575,13 +5576,6 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
         WEBGPU_INTERNAL_FreeCommandBuffer(wrapper);
         SDL_UnlockMutex(renderer->submittingCommandBufferLock);
         return SDL_SetError("Could not finish WebGPU command encoder!");
-    }
-
-    if (wrapper->renderer->queueDoneFence != NULL) {
-        // Reregister the fence
-        WEBGPU_INTERNAL_ReregisterFence(wrapper->queue, wrapper->renderer->queueDoneFence);
-    } else {
-        wrapper->renderer->queueDoneFence = WEBGPU_INTERNAL_CreateFence(wrapper->queue);
     }
 
     wrapper->submitted.fence = WEBGPU_INTERNAL_CreateFence(wrapper->queue);
