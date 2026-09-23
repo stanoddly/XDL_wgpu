@@ -4600,6 +4600,10 @@ static void WEBGPU_UploadToTexture(SDL_GPUCommandBuffer *copyPass, const SDL_GPU
     size_t paddedBytesPerRow = ALIGN_VALUE(bytesPerRowDest, 256);
     size_t blocksPerLayer = (destination->h + blockHeight - 1) / blockHeight;
 
+    // rows_per_layer of 0 means the layers in the transfer buffer are tightly packed.
+    Uint32 rowsPerLayerSource = source->rows_per_layer != 0 ? source->rows_per_layer : destination->h;
+    size_t blocksPerLayerSource = (rowsPerLayerSource + blockHeight - 1) / blockHeight;
+
     WebGPUBuffer *userSourceBuffer = ((WebGPUBufferContainer *)source->transfer_buffer)->activeBuffer;
     WebGPUBuffer *finalSourceBuffer = userSourceBuffer;
 
@@ -4619,18 +4623,21 @@ static void WEBGPU_UploadToTexture(SDL_GPUCommandBuffer *copyPass, const SDL_GPU
                               &(WGPUTexelCopyBufferLayout){
                                   .bytesPerRow = bytesPerRowDest,
                                   .offset = source->offset,
-                                  .rowsPerImage = blocksPerLayer,
+                                  .rowsPerImage = blocksPerLayerSource,
                               },
                               &(WGPUExtent3D){ paddedWidth, paddedHeight, destination->d });
     } else {
         if (paddedBytesPerRow != bytesPerRowDest) {
             // FIXME: Why are we creating a whole new buffer just for a single upload? We need to create a buffer pool.
-            WebGPUBuffer *babysittingSourceBuffer = WEBGPU_INTERNAL_CreateBuffer(cmdBuf->renderer, paddedBytesPerRow * blocksPerLayer, 0,
+            // The padded copy packs the layers tightly, so its layers are blocksPerLayer rows apart.
+            WebGPUBuffer *babysittingSourceBuffer = WEBGPU_INTERNAL_CreateBuffer(cmdBuf->renderer, paddedBytesPerRow * blocksPerLayer * destination->d, 0,
                                                                                  WEBGPU_BUFFER_TYPE_TRANSFER_GPUONLY, "Autopadded Texture Transfer Buffer");
 
-            for (int i = 0; i < blocksPerLayer; i++) {
-                wgpuCommandEncoderCopyBufferToBuffer(cmdBuf->encoder, userSourceBuffer->buffer, source->offset + i * bytesPerRowSource,
-                                                     babysittingSourceBuffer->buffer, i * paddedBytesPerRow, ALIGN_VALUE(bytesPerRowSource, 4));
+            for (Uint32 layer = 0; layer < destination->d; layer++) {
+                for (size_t row = 0; row < blocksPerLayer; row++) {
+                    wgpuCommandEncoderCopyBufferToBuffer(cmdBuf->encoder, userSourceBuffer->buffer, source->offset + (layer * blocksPerLayerSource + row) * bytesPerRowSource,
+                                                         babysittingSourceBuffer->buffer, (layer * blocksPerLayer + row) * paddedBytesPerRow, ALIGN_VALUE(bytesPerRowSource, 4));
+                }
             }
 
             finalSourceBuffer = babysittingSourceBuffer;
@@ -4641,7 +4648,7 @@ static void WEBGPU_UploadToTexture(SDL_GPUCommandBuffer *copyPass, const SDL_GPU
             .buffer = finalSourceBuffer->buffer,
             .layout = (WGPUTexelCopyBufferLayout){
                 .bytesPerRow = paddedBytesPerRow,
-                .rowsPerImage = blocksPerLayer,
+                .rowsPerImage = hadToPad ? blocksPerLayer : blocksPerLayerSource,
                 .offset = hadToPad ? 0 : source->offset,
             },
         };
