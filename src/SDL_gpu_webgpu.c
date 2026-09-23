@@ -2690,6 +2690,7 @@ static void WEBGPU_INTERNAL_AbandonSubmittedCommandBuffers(WebGPURenderer *rende
     for (int i = 0; i < renderer->submittedCommandBufferCount; i++) {
         WebGPUSubmittedCommandBuffer *current = renderer->submittedCommandBuffers[i];
         if (current != NULL) {
+            WEBGPU_INTERNAL_ForgetFuture((double)current->fence->future.future.id);
             current->fence = NULL;
             WEBGPU_INTERNAL_QueueSubmittedCommandBufferForRelease(renderer, current);
         }
@@ -2822,6 +2823,7 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
                     wasReleased = true;
                 } else if (forciblyDestroy) {
                     // Leak it on purpose rather than free memory a late callback could still write to.
+                    WEBGPU_INTERNAL_ForgetFuture((double)current->resource.fence->future.future.id);
                     SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Fence never signaled; dropping it from the destroy queue without freeing.");
                     wasReleased = true;
                 }
@@ -5578,6 +5580,9 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
         return SDL_SetError("Could not finish WebGPU command encoder!");
     }
 
+    wgpuQueueSubmit(wrapper->queue, 1, &cmdBuf);
+
+    // onSubmittedWorkDone only covers work submitted before it, so the fence has to follow the submit.
     wrapper->submitted.fence = WEBGPU_INTERNAL_CreateFence(wrapper->queue);
 
     submitted = SDL_calloc(1, sizeof(*submitted));
@@ -5585,8 +5590,6 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
 
     WEBGPU_INTERNAL_InsertElementIntoArray(wrapper->renderer->submittedCommandBuffers, wrapper->renderer->submittedCommandBufferCapacity,
                                            wrapper->renderer->submittedCommandBufferCount, WebGPUSubmittedCommandBuffer *, submitted);
-
-    wgpuQueueSubmit(wrapper->queue, 1, &cmdBuf);
     WEBGPU_INTERNAL_PublishQueuedRepacks(wrapper);
 
     if (isMainThread) {
