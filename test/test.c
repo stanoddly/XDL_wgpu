@@ -210,6 +210,20 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
     }
     SDL_Log("SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_PRIVATE) rejected: %s", SDL_GetError());
 
+    state->window = SDL_CreateWindow("XDL_wgpu test", 256, 256, 0);
+    if (!state->window) {
+        SDL_Log("SDL_CreateWindow failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
+    // Destroying a device must release the windows it still claims, so the window can be claimed again below.
+    SDL_GPUDevice *transient_device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_WGSL, true, NULL);
+    if (!transient_device || !SDL_ClaimWindowForGPUDevice(transient_device, state->window)) {
+        SDL_Log("Transient device setup failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    SDL_DestroyGPUDevice(transient_device);
+
     state->device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_WGSL, true, NULL);
     if (!state->device) {
         SDL_Log("SDL_CreateGPUDevice failed: %s", SDL_GetError());
@@ -218,11 +232,23 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
     SDL_Log("Device shader formats: 0x%x", (unsigned)SDL_GetGPUShaderFormats(state->device));
     SDL_Log("Device driver: %s", SDL_GetGPUDeviceDriver(state->device));
 
-    state->window = SDL_CreateWindow("XDL_wgpu test", 256, 256, 0);
-    if (!state->window || !SDL_ClaimWindowForGPUDevice(state->device, state->window)) {
-        SDL_Log("Window setup failed: %s", SDL_GetError());
+    if (!SDL_ClaimWindowForGPUDevice(state->device, state->window)) {
+        SDL_Log("Claiming the window after destroying its previous device failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
+
+    // A window claimed by one device must not be claimable by another.
+    SDL_GPUDevice *other_device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_WGSL, true, NULL);
+    if (!other_device) {
+        SDL_Log("Second SDL_CreateGPUDevice failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    if (SDL_ClaimWindowForGPUDevice(other_device, state->window)) {
+        SDL_Log("A second device claimed an already claimed window");
+        return SDL_APP_FAILURE;
+    }
+    SDL_Log("Second claim rejected: %s", SDL_GetError());
+    SDL_DestroyGPUDevice(other_device);
 
     // 256-byte rows at offset 0: WebGPU writes the app layout directly.
     static Uint8 pixels[TEST_WIDTH * TEST_HEIGHT * 4];
