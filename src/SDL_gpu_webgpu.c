@@ -47,9 +47,7 @@
 #include "XDL_wgpu.h"
 #include <webgpu/webgpu.h>
 
-#ifdef SDL_PLATFORM_EMSCRIPTEN
 #include <emscripten.h>
-#endif
 
 extern WGPUSurface XDL_WGPU_CreateSurface(SDL_Window *window, WGPUInstance instance);
 
@@ -5632,11 +5630,7 @@ static void WEBGPU_DestroyDevice(SDL_GPUDevice *device)
     // On Emscripten a submission completes only when the browser event loop runs. SDL_DelayNS yields to it under Asyncify or
     // JSPI; without them nothing can yield here, and whatever is still pending after the first pass would never complete.
     // A lost device may never complete its submissions either, and a healthy one gets DESTROY_DEVICE_DRAIN_TIMEOUT_NS.
-#ifdef SDL_PLATFORM_EMSCRIPTEN
     bool canWaitForSubmissions = emscripten_has_asyncify() && SDL_GetHintBoolean(SDL_HINT_EMSCRIPTEN_ASYNCIFY, true);
-#else
-    bool canWaitForSubmissions = true;
-#endif
     Uint64 drainDeadline = SDL_GetTicksNS() + DESTROY_DEVICE_DRAIN_TIMEOUT_NS;
 
     WEBGPU_INTERNAL_HandlePendingDestroys(renderer, false);
