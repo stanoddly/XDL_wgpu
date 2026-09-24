@@ -92,7 +92,7 @@ As above, and also:
 
 ## Change the codecs
 
-The codecs of SDL_image and SDL_mixer are the `set(SDLIMAGE_…)` and `set(SDLMIXER_…)` lines under `XDL_BUILD_SDL_LIBRARIES` in `CMakeLists.txt`. The build uses only codecs that need no extra library, so each release has five archives. A codec that needs a library (libwebp, libopus and others) needs the library's submodule; its archive merged into `SDL3_image.a` or `SDL3_mixer.a` in `tools/build-release.sh`, as `SDL3_ttf.a` holds SDL_ttf's libraries; its row in the release notes; and its license and copyright lines in `THIRD-PARTY-NOTICES.txt`. Update the codec lists in README, Releases.
+The codecs of SDL_image and SDL_mixer are the `set(SDLIMAGE_…)` and `set(SDLMIXER_…)` lines under `XDL_BUILD_SDL_LIBRARIES` in `CMakeLists.txt`. The build uses only codecs that need no extra library, so each release has five archives. A codec that needs a library (libwebp, libopus and others) needs the library's submodule; its objects in `SDL3_image.a` or `SDL3_mixer.a`, which SDL_image and SDL_mixer do not do by themselves (unlike SDL_ttf, whose archive holds its vendored libraries), so `tools/build-release.sh` has to merge them; its row in the release notes; and its license and copyright lines in `THIRD-PARTY-NOTICES.txt`. Update the codec lists in README, Releases.
 
 ## .NET and Emscripten
 

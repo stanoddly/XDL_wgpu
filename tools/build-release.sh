@@ -15,7 +15,7 @@ flags="-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0"
 rm -rf "$build_dir"
 emcmake cmake -S "$repo_root" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DXDL_BUILD_TEST=OFF -DXDL_BUILD_SDL_LIBRARIES=ON -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$flags"
 # A bare --parallel gives make no job limit, which starts every SDL compile at once.
-cmake --build "$build_dir" --parallel "$(nproc)" --target XDL_wgpu SDL3-static SDL3_image-static SDL3_mixer-static SDL3_ttf-static freetype harfbuzz plutosvg plutovg
+cmake --build "$build_dir" --parallel "$(nproc)" --target XDL_wgpu SDL3-static SDL3_image-static SDL3_mixer-static SDL3_ttf-static
 
 rm -rf "$out_dir"
 mkdir -p "$out_dir"
@@ -26,18 +26,8 @@ cp "$build_dir/libXDL_wgpu.a" "$out_dir/"
 cp "$build_dir/external/SDL/libSDL3.a" "$out_dir/SDL3.a"
 cp "$build_dir/external/SDL_image/libSDL3_image.a" "$out_dir/SDL3_image.a"
 cp "$build_dir/external/SDL_mixer/libSDL3_mixer.a" "$out_dir/SDL3_mixer.a"
-# SDL3_ttf.a also holds the objects of the libraries SDL_ttf vendors, so it links on its own.
-ttf_dir=$build_dir/external/SDL_ttf
-emar -M <<EOF
-CREATE $out_dir/SDL3_ttf.a
-ADDLIB $ttf_dir/libSDL3_ttf.a
-ADDLIB $ttf_dir/external/freetype/libfreetype.a
-ADDLIB $ttf_dir/external/harfbuzz/libharfbuzz.a
-ADDLIB $ttf_dir/external/plutosvg/libplutosvg.a
-ADDLIB $ttf_dir/external/plutovg/libplutovg.a
-SAVE
-END
-EOF
+# SDL_ttf's static build already puts the objects of its vendored libraries into its archive, so it links on its own.
+cp "$build_dir/external/SDL_ttf/libSDL3_ttf.a" "$out_dir/SDL3_ttf.a"
 
 freetype_year=$(grep -m1 -oE 'Copyright \(C\) 1996-[0-9]{4}' "$repo_root/external/SDL_ttf/external/freetype/include/freetype/freetype.h" | grep -oE '[0-9]{4}$')
 freetype_acknowledgment="Portions of this software are copyright © $freetype_year The FreeType Project (www.freetype.org). All rights reserved."
@@ -142,10 +132,10 @@ library_copyrights() {
 } > "$out_dir/THIRD-PARTY-NOTICES.txt"
 
 emscripten_version=$(emcc --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-# One row of the release notes' source table. A submodule's version is the remote's tag of its commit: the workflow's shallow checkout
+# One row of the release notes' source table. XDL_wgpu's version is the release tag. A submodule's version is the remote's tag of its commit: the workflow's shallow checkout
 # fetches no tags. A commit without a tag has no version.
 source_row() {
-    local commit="" url="" version=""
+    local commit="" url="" version=${4:-}
     commit=$(git -C "$repo_root/$3" rev-parse HEAD)
     if [ "$3" = . ]; then
         url=https://github.com/$repository
@@ -160,7 +150,7 @@ source_row() {
 {
     printf 'Built with Emscripten %s and `%s`, for the .NET browser runtime of the same Emscripten.\n\n' "$emscripten_version" "$flags"
     printf '| Archive | Library | Version | Commit |\n|---|---|---|---|\n'
-    source_row libXDL_wgpu.a XDL_wgpu .
+    source_row libXDL_wgpu.a XDL_wgpu . "$tag"
     source_row SDL3.a SDL external/SDL
     source_row SDL3_image.a SDL_image external/SDL_image
     source_row SDL3_mixer.a SDL_mixer external/SDL_mixer
