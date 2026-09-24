@@ -13,11 +13,9 @@
         <_XdlArchiveDirectory>$([MSBuild]::EnsureTrailingSlash('$(XdlArchiveDirectory)'))</_XdlArchiveDirectory>
     </PropertyGroup>
 
-    <!-- The order of the release notes: libXDL_wgpu.a first, so its SDL_GPU* definitions win over SDL3.a's. -->
+    <!-- The order of the release notes: libXDL_wgpu.a first, so its SDL_GPU* definitions win over those of SDL3.a. -->
     <ItemGroup>
-        <NativeFileReference Include="$(_XdlArchiveDirectory)libXDL_wgpu.a" ScanForPInvokes="false" />
-        <NativeFileReference Include="$(_XdlArchiveDirectory)SDL3.a;$(_XdlArchiveDirectory)SDL3_image.a;$(_XdlArchiveDirectory)SDL3_mixer.a;$(_XdlArchiveDirectory)SDL3_ttf.a" />
-        <NativeFileReference Include="$(_XdlArchiveDirectory)libfreetype.a;$(_XdlArchiveDirectory)libharfbuzz.a;$(_XdlArchiveDirectory)libplutosvg.a;$(_XdlArchiveDirectory)libplutovg.a" ScanForPInvokes="false" />
+        <NativeFileReference Include="$(_XdlArchiveDirectory)libXDL_wgpu.a;$(_XdlArchiveDirectory)SDL3.a;$(_XdlArchiveDirectory)SDL3_image.a;$(_XdlArchiveDirectory)SDL3_mixer.a;$(_XdlArchiveDirectory)SDL3_ttf.a" />
     </ItemGroup>
 
     <Target Name="_RequireXdlArchiveDirectory" BeforeTargets="BeforeBuild" Condition="'$(XdlArchiveDirectory)' == ''">

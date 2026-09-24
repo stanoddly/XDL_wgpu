@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds the release archives with the .NET browser runtime's exception flags and stages them in build/release-assets with the
-# header, the licenses, THIRD-PARTY-NOTICES.txt, versions.json, SHA256SUMS and release-notes.md.
+# Builds the release archives with the .NET browser runtime's exception flags and stages them in build/release-assets with
+# THIRD-PARTY-NOTICES.txt and release-notes.md.
 # Usage: tools/build-release.sh <tag> <owner/repo>   (emcc on PATH, for example from tools/emsdk-env.sh)
 set -euo pipefail
 
@@ -11,7 +11,7 @@ out_dir=$repo_root/build/release-assets
 build_dir=$repo_root/build/release
 flags="-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0"
 
-# A fresh configure, so the archives come from the emcc on PATH that versions.json names, not from a compiler an older configure cached.
+# A fresh configure, so the archives come from the emcc on PATH that the release notes name, not from a compiler an older configure cached.
 rm -rf "$build_dir"
 emcmake cmake -S "$repo_root" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DXDL_BUILD_TEST=OFF -DXDL_BUILD_SDL_LIBRARIES=ON -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$flags"
 # A bare --parallel gives make no job limit, which starts every SDL compile at once.
@@ -21,29 +21,23 @@ rm -rf "$out_dir"
 mkdir -p "$out_dir"
 
 # The SDL archives drop the lib prefix: the .NET wasm build registers each native reference's file name as the P/Invoke module that
-# DllImport("SDL3") and the others bind to. The rest keep theirs, so no DllImport binds to them by accident.
+# DllImport("SDL3") and the others bind to. libXDL_wgpu.a keeps its prefix, so no DllImport binds to it by accident.
 cp "$build_dir/libXDL_wgpu.a" "$out_dir/"
 cp "$build_dir/external/SDL/libSDL3.a" "$out_dir/SDL3.a"
 cp "$build_dir/external/SDL_image/libSDL3_image.a" "$out_dir/SDL3_image.a"
 cp "$build_dir/external/SDL_mixer/libSDL3_mixer.a" "$out_dir/SDL3_mixer.a"
-cp "$build_dir/external/SDL_ttf/libSDL3_ttf.a" "$out_dir/SDL3_ttf.a"
-for dependency in freetype harfbuzz plutosvg plutovg; do
-    cp "$build_dir/external/SDL_ttf/external/$dependency/lib$dependency.a" "$out_dir/"
-done
-cp "$repo_root/include/XDL_wgpu.h" "$out_dir/"
-
-cp "$repo_root/LICENSE" "$out_dir/LICENSE-XDL_wgpu.txt"
-cp "$repo_root/external/SDL/LICENSE.txt" "$out_dir/LICENSE-SDL.txt"
-cp "$repo_root/external/SDL_image/LICENSE.txt" "$out_dir/LICENSE-SDL_image.txt"
-cp "$repo_root/external/SDL_mixer/LICENSE.txt" "$out_dir/LICENSE-SDL_mixer.txt"
-cp "$repo_root/external/SDL_mixer/src/timidity/COPYING" "$out_dir/LICENSE-timidity.txt"
-cp "$repo_root/external/SDL_mixer/src/dr_libs/LICENSE" "$out_dir/LICENSE-dr_libs.txt"
-cp "$repo_root/external/SDL_ttf/LICENSE.txt" "$out_dir/LICENSE-SDL_ttf.txt"
-cp "$repo_root/external/SDL_ttf/external/freetype/LICENSE.TXT" "$out_dir/LICENSE-freetype.txt"
-cp "$repo_root/external/SDL_ttf/external/freetype/docs/FTL.TXT" "$out_dir/LICENSE-freetype-FTL.txt"
-cp "$repo_root/external/SDL_ttf/external/harfbuzz/COPYING" "$out_dir/LICENSE-harfbuzz.txt"
-cp "$repo_root/external/SDL_ttf/external/plutosvg/LICENSE" "$out_dir/LICENSE-plutosvg.txt"
-cp "$repo_root/external/SDL_ttf/external/plutovg/LICENSE" "$out_dir/LICENSE-plutovg.txt"
+# SDL3_ttf.a also holds the objects of the libraries SDL_ttf vendors, so it links on its own.
+ttf_dir=$build_dir/external/SDL_ttf
+emar -M <<EOF
+CREATE $out_dir/SDL3_ttf.a
+ADDLIB $ttf_dir/libSDL3_ttf.a
+ADDLIB $ttf_dir/external/freetype/libfreetype.a
+ADDLIB $ttf_dir/external/harfbuzz/libharfbuzz.a
+ADDLIB $ttf_dir/external/plutosvg/libplutosvg.a
+ADDLIB $ttf_dir/external/plutovg/libplutovg.a
+SAVE
+END
+EOF
 
 freetype_year=$(grep -m1 -oE 'Copyright \(C\) 1996-[0-9]{4}' "$repo_root/external/SDL_ttf/external/freetype/include/freetype/freetype.h" | grep -oE '[0-9]{4}$')
 freetype_acknowledgment="Portions of this software are copyright © $freetype_year The FreeType Project (www.freetype.org). All rights reserved."
@@ -93,19 +87,31 @@ copyright_lines() {
 # does not list in full.
 library_copyrights() {
     local files="" text=""
-    files=$(grep "^$repo_real/$3" "$build_dir/compiled-sources.txt") || files=""
-    if [ -n "${4:-}" ]; then
-        files=$(printf '%s\n' "$files" | grep -v "^$repo_real/$4") || files=""
+    files=$(grep "^$repo_real/$2" "$build_dir/compiled-sources.txt") || files=""
+    if [ -n "${3:-}" ]; then
+        files=$(printf '%s\n' "$files" | grep -v "^$repo_real/$3") || files=""
     fi
     text=$(printf '%s\n' "$files" | copyright_lines) || text=""
-    section "Copyright lines of $1, licensed under $2" "every distinct copyright line in its sources and headers compiled into this release" "$text"
+    section "Copyright lines of $1" "every distinct copyright line in its sources and headers compiled into this release" "$text"
 }
 
 {
-    printf 'Notices for the archives of this release, from the sources in versions.json. The license of each library is in its LICENSE-*.txt file.\n'
-    printf 'Below are the FreeType acknowledgment, the notices of third-party code whose license the library'"'"'s own does not cover, and the\n'
-    printf 'copyright lines of every source and header compiled into each library.\n\n'
-    printf '==== FreeType (libfreetype.a)\n\n%s\n\n' "$freetype_acknowledgment"
+    printf 'Licenses and notices for the archives of this release. SDL3_ttf.a also contains the libraries SDL_ttf vendors: FreeType,\n'
+    printf 'HarfBuzz, plutosvg and plutovg. Below are the license of each library, the FreeType acknowledgment, the notices of third-party\n'
+    printf 'code whose license the library'"'"'s own does not cover, and the copyright lines of every source and header compiled into each library.\n\n'
+    notice_file "XDL_wgpu license (libXDL_wgpu.a)" LICENSE
+    notice_file "SDL license (SDL3.a)" external/SDL/LICENSE.txt
+    notice_file "SDL_image license (SDL3_image.a)" external/SDL_image/LICENSE.txt
+    notice_file "SDL_mixer license (SDL3_mixer.a)" external/SDL_mixer/LICENSE.txt
+    notice_file "SDL_mixer: TiMidity license (SDL3_mixer.a)" external/SDL_mixer/src/timidity/COPYING
+    notice_file "SDL_mixer: dr_libs license (SDL3_mixer.a)" external/SDL_mixer/src/dr_libs/LICENSE
+    notice_file "SDL_ttf license (SDL3_ttf.a)" external/SDL_ttf/LICENSE.txt
+    notice_file "FreeType license (SDL3_ttf.a)" external/SDL_ttf/external/freetype/LICENSE.TXT
+    notice_file "FreeType License, the FTL, under which this release uses FreeType (SDL3_ttf.a)" external/SDL_ttf/external/freetype/docs/FTL.TXT
+    notice_file "HarfBuzz license (SDL3_ttf.a)" external/SDL_ttf/external/harfbuzz/COPYING
+    notice_file "plutosvg license (SDL3_ttf.a)" external/SDL_ttf/external/plutosvg/LICENSE
+    notice_file "plutovg license (SDL3_ttf.a)" external/SDL_ttf/external/plutovg/LICENSE
+    printf '==== FreeType acknowledgment (SDL3_ttf.a)\n\n%s\n\n' "$freetype_acknowledgment"
     # Found with a search of every compiled source and header for copyright lines, license texts and references to Unicode data.
     # Public-domain code and zlib-licensed code, whose license asks for no notice in a binary, are not listed.
     notice "SDL: math functions from Sun's libm (SDL3.a)" external/SDL/src/libm/e_atan2.c 'Copyright \(C\) 1993 by Sun Microsystems' 'is preserved\.'
@@ -113,83 +119,55 @@ library_copyrights() {
     notice "SDL: keysym to UCS conversion (SDL3.a)" external/SDL/src/events/imKStoUCS.c 'Copyright \(C\) 2003-2006,2008 Jamey Sharp' 'DEALINGS IN THE SOFTWARE\.$'
     notice "SDL_image: GIF decoder adapted from XPaint (SDL3_image.a)" external/SDL_image/src/IMG_gif.c 'Copyright 1990, 1991, 1993 David Koblas' 'provided "as is"'
     notice "SDL_image: QOI codec (SDL3_image.a)" external/SDL_image/src/qoi.h 'Copyright\(c\) 2021 Dominic Szablewski' '^SOFTWARE\.$'
-    notice "FreeType: BDF driver (libfreetype.a)" external/SDL_ttf/external/freetype/src/bdf/README '^License$' '^THE USE OR OTHER DEALINGS IN THE SOFTWARE\.$'
-    notice "FreeType: PCF driver (libfreetype.a)" external/SDL_ttf/external/freetype/src/pcf/README '^License$' '^SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE\.$'
-    notice "FreeType: PCF bitmap utilities (libfreetype.a)" external/SDL_ttf/external/freetype/src/pcf/pcfutil.c 'Copyright 1990, 1994, 1998  The Open Group' 'written authorization from The Open Group\.'
-    notice "FreeType: HarfBuzz glue of the auto-hinter (libfreetype.a)" external/SDL_ttf/external/freetype/src/autofit/ft-hb.c 'Copyright © 2009, 2023  Red Hat' 'OR MODIFICATIONS\.$'
-    notice_file "HarfBuzz: Universal Shaping Engine data (libharfbuzz.a)" external/SDL_ttf/external/harfbuzz/src/ms-use/COPYING
-    notice "HarfBuzz: Unicode character database functions (libharfbuzz.a)" external/SDL_ttf/external/harfbuzz/src/hb-ucd.cc 'Copyright \(C\) 2012 Grigori Goronzy' 'USE OR PERFORMANCE OF THIS SOFTWARE\.'
-    notice "HarfBuzz: fasthash (libharfbuzz.a)" external/SDL_ttf/external/harfbuzz/src/hb-algs.hh 'Copyright \(C\) 2012 Zilong Tan' '^   SOFTWARE\.$'
+    notice "FreeType: BDF driver (SDL3_ttf.a)" external/SDL_ttf/external/freetype/src/bdf/README '^License$' '^THE USE OR OTHER DEALINGS IN THE SOFTWARE\.$'
+    notice "FreeType: PCF driver (SDL3_ttf.a)" external/SDL_ttf/external/freetype/src/pcf/README '^License$' '^SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE\.$'
+    notice "FreeType: PCF bitmap utilities (SDL3_ttf.a)" external/SDL_ttf/external/freetype/src/pcf/pcfutil.c 'Copyright 1990, 1994, 1998  The Open Group' 'written authorization from The Open Group\.'
+    notice "FreeType: HarfBuzz glue of the auto-hinter (SDL3_ttf.a)" external/SDL_ttf/external/freetype/src/autofit/ft-hb.c 'Copyright © 2009, 2023  Red Hat' 'OR MODIFICATIONS\.$'
+    notice_file "HarfBuzz: Universal Shaping Engine data (SDL3_ttf.a)" external/SDL_ttf/external/harfbuzz/src/ms-use/COPYING
+    notice "HarfBuzz: Unicode character database functions (SDL3_ttf.a)" external/SDL_ttf/external/harfbuzz/src/hb-ucd.cc 'Copyright \(C\) 2012 Grigori Goronzy' 'USE OR PERFORMANCE OF THIS SOFTWARE\.'
+    notice "HarfBuzz: fasthash (SDL3_ttf.a)" external/SDL_ttf/external/harfbuzz/src/hb-algs.hh 'Copyright \(C\) 2012 Zilong Tan' '^   SOFTWARE\.$'
     # No pinned source carries the license of the Unicode data HarfBuzz generates its tables from (hb-ucd-table.hh, hb-unicode-emoji-table.hh,
     # the shaper tables), so the repository keeps a copy of https://www.unicode.org/license.txt.
-    notice_file "HarfBuzz: tables generated from Unicode data (libharfbuzz.a)" LICENSES/Unicode-3.0.txt
+    notice_file "HarfBuzz: tables generated from Unicode data (SDL3_ttf.a)" LICENSES/Unicode-3.0.txt
 
-    library_copyrights "XDL_wgpu (libXDL_wgpu.a)" LICENSE-XDL_wgpu.txt "src/"
-    library_copyrights "SDL (SDL3.a)" LICENSE-SDL.txt "external/SDL/"
-    library_copyrights "SDL_image (SDL3_image.a)" LICENSE-SDL_image.txt "external/SDL_image/"
-    library_copyrights "SDL_mixer (SDL3_mixer.a)" LICENSE-SDL_mixer.txt "external/SDL_mixer/"
-    library_copyrights "SDL_ttf (SDL3_ttf.a)" LICENSE-SDL_ttf.txt "external/SDL_ttf/" "external/SDL_ttf/external/"
-    library_copyrights "FreeType (libfreetype.a)" LICENSE-freetype.txt "external/SDL_ttf/external/freetype/"
-    library_copyrights "HarfBuzz (libharfbuzz.a)" LICENSE-harfbuzz.txt "external/SDL_ttf/external/harfbuzz/"
-    library_copyrights "plutosvg (libplutosvg.a)" LICENSE-plutosvg.txt "external/SDL_ttf/external/plutosvg/"
-    library_copyrights "plutovg (libplutovg.a)" LICENSE-plutovg.txt "external/SDL_ttf/external/plutovg/"
+    library_copyrights "XDL_wgpu (libXDL_wgpu.a)" "src/"
+    library_copyrights "SDL (SDL3.a)" "external/SDL/"
+    library_copyrights "SDL_image (SDL3_image.a)" "external/SDL_image/"
+    library_copyrights "SDL_mixer (SDL3_mixer.a)" "external/SDL_mixer/"
+    library_copyrights "SDL_ttf (SDL3_ttf.a)" "external/SDL_ttf/" "external/SDL_ttf/external/"
+    library_copyrights "FreeType (SDL3_ttf.a)" "external/SDL_ttf/external/freetype/"
+    library_copyrights "HarfBuzz (SDL3_ttf.a)" "external/SDL_ttf/external/harfbuzz/"
+    library_copyrights "plutosvg (SDL3_ttf.a)" "external/SDL_ttf/external/plutosvg/"
+    library_copyrights "plutovg (SDL3_ttf.a)" "external/SDL_ttf/external/plutovg/"
 } > "$out_dir/THIRD-PARTY-NOTICES.txt"
 
 emscripten_version=$(emcc --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-# The release tag of a submodule's commit. The workflow's shallow checkout fetches no tags, so the tag comes from the remote; a commit
-# without one falls back to git describe, which names the short hash.
-describe_source() {
-    local commit="" tag=""
-    commit=$(git -C "$repo_root/$1" rev-parse HEAD)
-    if [ "$1" != . ]; then
-        tag=$(GIT_TERMINAL_PROMPT=0 git -C "$repo_root/$1" ls-remote --tags origin | awk -v commit="$commit" '$1 == commit { sub(/^refs\/tags\//, "", $2); sub(/\^\{\}$/, "", $2); print $2; exit }') || tag=""
+# One row of the release notes' source table. A submodule's version is the remote's tag of its commit: the workflow's shallow checkout
+# fetches no tags. A commit without a tag has no version.
+source_row() {
+    local commit="" url="" version=""
+    commit=$(git -C "$repo_root/$3" rev-parse HEAD)
+    if [ "$3" = . ]; then
+        url=https://github.com/$repository
+    else
+        url=$(git -C "$repo_root/$3" remote get-url origin)
+        url=${url/#git@github.com:/https://github.com/}
+        url=${url%.git}
+        version=$(GIT_TERMINAL_PROMPT=0 git -C "$repo_root/$3" ls-remote --tags origin | awk -v commit="$commit" '$1 == commit { sub(/^refs\/tags\//, "", $2); sub(/\^\{\}$/, "", $2); print $2; exit }') || version=""
     fi
-    if [ -z "$tag" ]; then
-        tag=$(git -C "$repo_root/$1" describe --tags --always)
-    fi
-    printf '%s' "$tag"
-}
-source_entry() {
-    printf '    "%s": { "commit": "%s", "describe": "%s" }' "$1" "$(git -C "$repo_root/$2" rev-parse HEAD)" "$(describe_source "$2")"
-}
-{
-    printf '{\n  "version": "%s",\n  "emscripten": "%s",\n  "flags": "%s",\n  "sources": {\n' "$tag" "$emscripten_version" "$flags"
-    source_entry XDL_wgpu . && printf ',\n'
-    source_entry SDL external/SDL && printf ',\n'
-    source_entry SDL_image external/SDL_image && printf ',\n'
-    source_entry SDL_mixer external/SDL_mixer && printf ',\n'
-    source_entry SDL_ttf external/SDL_ttf && printf ',\n'
-    source_entry freetype external/SDL_ttf/external/freetype && printf ',\n'
-    source_entry harfbuzz external/SDL_ttf/external/harfbuzz && printf ',\n'
-    source_entry plutosvg external/SDL_ttf/external/plutosvg && printf ',\n'
-    source_entry plutovg external/SDL_ttf/external/plutovg && printf '\n'
-    printf '  }\n}\n'
-} > "$out_dir/versions.json"
-
-(cd "$out_dir" && sha256sum -- *.a *.h *.txt versions.json > SHA256SUMS)
-
-# The reference order is the link order. libXDL_wgpu.a comes first so its SDL_GPU* definitions win over SDL3.a's.
-hash_of() {
-    grep -E " $1\$" "$out_dir/SHA256SUMS" | cut -d' ' -f1
-}
-url_reference() {
-    printf '  <NativeUrlReference Include="https://github.com/%s/releases/download/%s/%s" Sha256="%s"%s />\n' "$repository" "$tag" "$1" "$(hash_of "$1")" "$2"
+    printf '| %s | %s | %s | [%s](%s/commit/%s) |\n' "$1" "$2" "$version" "${commit:0:7}" "$url" "$commit"
 }
 {
     printf 'Built with Emscripten %s and `%s`, for the .NET browser runtime of the same Emscripten.\n\n' "$emscripten_version" "$flags"
-    printf '| Library | Source |\n|---|---|\n'
-    for name in SDL SDL_image SDL_mixer SDL_ttf; do
-        printf '| %s | `%s` |\n' "$name" "$(describe_source "external/$name")"
+    printf '| Archive | Library | Version | Commit |\n|---|---|---|---|\n'
+    source_row libXDL_wgpu.a XDL_wgpu .
+    source_row SDL3.a SDL external/SDL
+    source_row SDL3_image.a SDL_image external/SDL_image
+    source_row SDL3_mixer.a SDL_mixer external/SDL_mixer
+    source_row SDL3_ttf.a SDL_ttf external/SDL_ttf
+    for dependency in FreeType:freetype HarfBuzz:harfbuzz plutosvg:plutosvg plutovg:plutovg; do
+        source_row "" "${dependency%%:*}" "external/SDL_ttf/external/${dependency#*:}"
     done
-    printf '| FreeType, HarfBuzz, plutosvg, plutovg | vendored by SDL_ttf, commits in `versions.json` |\n\n'
-    printf 'Licenses: `LICENSE-*.txt` for each library, and `THIRD-PARTY-NOTICES.txt` for third-party code compiled into them. %s\n\n' "$freetype_acknowledgment"
-    printf 'Pixely (`NativeUrlReference`), in this order:\n\n```xml\n<ItemGroup>\n'
-    url_reference libXDL_wgpu.a ' ScanForPInvokes="false"'
-    for archive in SDL3.a SDL3_image.a SDL3_mixer.a SDL3_ttf.a; do
-        url_reference "$archive" ''
-    done
-    for dependency in freetype harfbuzz plutosvg plutovg; do
-        url_reference "lib$dependency.a" ' ScanForPInvokes="false"'
-    done
-    printf '</ItemGroup>\n```\n'
+    printf '\nLink the archives in the order of the table: `libXDL_wgpu.a` first, so its `SDL_GPU*` definitions win over those of `SDL3.a`. `SDL3_ttf.a` contains FreeType, HarfBuzz, plutosvg and plutovg. [`tools/native-references.sh`](https://github.com/%s/blob/%s/tools/native-references.sh) prints the archives as MSBuild items.\n\n' "$repository" "$tag"
+    printf 'Licenses: `THIRD-PARTY-NOTICES.txt`. %s\n' "$freetype_acknowledgment"
 } > "$out_dir/release-notes.md"
