@@ -1,0 +1,78 @@
+name: Release
+
+# Started by hand. The tag is the released commit's UTC commit time (vYYYYMMDD.HHMMSS), so a second run for the same commit stops
+# at the existing release instead of publishing a duplicate.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # SDL_image's and SDL_mixer's own submodules are not needed: their codecs are built in (see XDL_BUILD_SDL_LIBRARIES).
+      - name: Check out the pinned libraries
+        run: |
+          git submodule update --init --depth 1 external/SDL external/SDL_image external/SDL_mixer external/SDL_ttf
+          git -C external/SDL_ttf submodule update --init --depth 1 external/freetype external/harfbuzz external/plutosvg external/plutovg
+
+      - name: Compute the tag
+        run: echo "TAG=$(TZ=UTC git log -1 --date=format-local:%Y%m%d.%H%M%S --format=v%cd)" >> "$GITHUB_ENV"
+
+      - name: Stop if this commit is released
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "::error::Release $TAG already exists."
+            exit 1
+          fi
+
+      # The archives link into the .NET browser runtime only when they are built by the Emscripten of its wasm-tools workload.
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '11.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Install the wasm-tools workload
+        run: dotnet workload install wasm-tools
+
+      - name: Install Chromium and a software Vulkan driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+          mkdir -p build/node
+          (cd build/node && npm init -y > /dev/null && npm install playwright-core --no-audit --no-fund)
+          build/node/node_modules/.bin/playwright-core install --with-deps chromium
+
+      - name: Build and run the smoke test
+        run: |
+          source tools/emsdk-env.sh
+          emcmake cmake -S . -B build/out -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/out --parallel
+          tools/run-test.sh
+
+      - name: Build the release assets
+        run: |
+          source tools/emsdk-env.sh
+          tools/build-release.sh "$TAG" "$GITHUB_REPOSITORY"
+
+      # A cache of its own: a .NET link into the cache tools/emsdk-env.sh uses emptied it locally, emdawnwebgpu port included.
+      - name: Link the release assets into the .NET browser runtime
+        run: |
+          dotnet publish test/dotnet -c Release -p:XdlArchiveDirectory="$PWD/build/release-assets" -p:WasmCachePath="$PWD/build/dotnet-em-cache"
+          node test/dotnet/run.mjs test/dotnet/bin/Release/net11.0/publish/wwwroot
+
+      - name: Publish the release
+        run: |
+          cd build/release-assets
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file release-notes.md -- *.a *.h *.txt versions.json SHA256SUMS

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk.WebAssembly">
+    <!--
+      Links the release archives into the .NET browser runtime and binds every library through its P/Invoke module.
+      dotnet publish test/dotnet -c Release -p:XdlArchiveDirectory=<release assets> -p:WasmCachePath=<writable Emscripten cache, not the one of tools/emsdk-env.sh>
+      node test/dotnet/run.mjs <publish wwwroot>
+    -->
+    <PropertyGroup>
+        <TargetFramework>net11.0</TargetFramework>
+        <OutputType>Exe</OutputType>
+        <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <EmccExtraLDFlags>--use-port=emdawnwebgpu</EmccExtraLDFlags>
+        <_XdlArchiveDirectory>$([MSBuild]::EnsureTrailingSlash('$(XdlArchiveDirectory)'))</_XdlArchiveDirectory>
+    </PropertyGroup>
+
+    <!-- The order of the release notes: libXDL_wgpu.a first, so its SDL_GPU* definitions win over SDL3.a's. -->
+    <ItemGroup>
+        <NativeFileReference Include="$(_XdlArchiveDirectory)libXDL_wgpu.a" ScanForPInvokes="false" />
+        <NativeFileReference Include="$(_XdlArchiveDirectory)SDL3.a;$(_XdlArchiveDirectory)SDL3_image.a;$(_XdlArchiveDirectory)SDL3_mixer.a;$(_XdlArchiveDirectory)SDL3_ttf.a" />
+        <NativeFileReference Include="$(_XdlArchiveDirectory)libfreetype.a;$(_XdlArchiveDirectory)libharfbuzz.a;$(_XdlArchiveDirectory)libplutosvg.a;$(_XdlArchiveDirectory)libplutovg.a" ScanForPInvokes="false" />
+    </ItemGroup>
+
+    <Target Name="_RequireXdlArchiveDirectory" BeforeTargets="BeforeBuild" Condition="'$(XdlArchiveDirectory)' == ''">
+        <Error Text="Set XdlArchiveDirectory to the directory tools/build-release.sh staged the archives in." />
+    </Target>
+</Project>
