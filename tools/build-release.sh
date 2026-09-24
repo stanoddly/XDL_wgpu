@@ -14,7 +14,8 @@ flags="-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0"
 # A fresh configure, so the archives come from the emcc on PATH that versions.json names, not from a compiler an older configure cached.
 rm -rf "$build_dir"
 emcmake cmake -S "$repo_root" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DXDL_BUILD_TEST=OFF -DXDL_BUILD_SDL_LIBRARIES=ON -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$flags"
-cmake --build "$build_dir" --parallel --target XDL_wgpu SDL3-static SDL3_image-static SDL3_mixer-static SDL3_ttf-static freetype harfbuzz plutosvg plutovg
+# A bare --parallel gives make no job limit, which starts every SDL compile at once.
+cmake --build "$build_dir" --parallel "$(nproc)" --target XDL_wgpu SDL3-static SDL3_image-static SDL3_mixer-static SDL3_ttf-static freetype harfbuzz plutosvg plutovg
 
 rm -rf "$out_dir"
 mkdir -p "$out_dir"
@@ -71,19 +72,22 @@ notice_file() {
 # Every source and header the compilers read for the archives, from their dependency files, outside the build directory.
 repo_real=$(realpath "$repo_root")
 find "$build_dir" -name '*.o.d' -exec cat {} + | tr -s ' \\\t' '\n\n\n' | grep '^/' | sort -u | xargs realpath -m -- | grep "^$repo_real/" | grep -v "^$repo_real/build/" | sort -u > "$build_dir/compiled-sources.txt"
-# The copyright lines of the given files, without comment decoration. A line ending in "by", or with years but no holder, continues
-# with the holder on the next line.
+# The copyright lines of the given files, without comment decoration. A line ending in "by", "and" or a comma, or with years but no
+# holder, continues on the next line of the same file.
 # Lines with a double quote are string literals and documentation examples, not notices.
 copyright_lines() {
     xargs -r awk '
         function clean(s) { sub(/^[[:space:]\/*#|]+/, "", s); sub(/[[:space:]\/*|]+$/, "", s); gsub(/[[:space:]]+/, " ", s); return s }
-        pending != "" { print pending " " clean($0); pending = ""; next }
-        tolower($0) ~ /copyright[[:space:]]*(\(c\)|©|[0-9][0-9][0-9][0-9])/ && $0 !~ /"/ {
-            line = clean($0)
-            holder = line
+        function continues(s,    holder) {
+            holder = s
             sub(/^[Cc][Oo][Pp][Yy][Rr][Ii][Gg][Hh][Tt][[:space:]]*(\([Cc]\)|©)?/, "", holder)
-            if (line ~ / by$/ || holder !~ /[A-Za-z]/) { pending = line } else { print line }
-        }' | sort -u
+            return s ~ /(,| and| by)$/ || holder !~ /[A-Za-z]/
+        }
+        function emit(s) { if (continues(s)) { pending = s } else { print s } }
+        FNR == 1 && pending != "" { print pending; pending = "" }
+        pending != "" { line = pending " " clean($0); pending = ""; emit(line); next }
+        tolower($0) ~ /copyright[[:space:]]*(\(c\)|©|[0-9][0-9][0-9][0-9])/ && $0 !~ /"/ { emit(clean($0)) }
+        END { if (pending != "") { print pending } }' | sort -u
 }
 # The copyright lines of one library's compiled files: the notices its license asks to keep, which a summary such as HarfBuzz's COPYING
 # does not list in full.
@@ -132,8 +136,21 @@ library_copyrights() {
 } > "$out_dir/THIRD-PARTY-NOTICES.txt"
 
 emscripten_version=$(emcc --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+# The release tag of a submodule's commit. The workflow's shallow checkout fetches no tags, so the tag comes from the remote; a commit
+# without one falls back to git describe, which names the short hash.
+describe_source() {
+    local commit="" tag=""
+    commit=$(git -C "$repo_root/$1" rev-parse HEAD)
+    if [ "$1" != . ]; then
+        tag=$(GIT_TERMINAL_PROMPT=0 git -C "$repo_root/$1" ls-remote --tags origin | awk -v commit="$commit" '$1 == commit { sub(/^refs\/tags\//, "", $2); sub(/\^\{\}$/, "", $2); print $2; exit }') || tag=""
+    fi
+    if [ -z "$tag" ]; then
+        tag=$(git -C "$repo_root/$1" describe --tags --always)
+    fi
+    printf '%s' "$tag"
+}
 source_entry() {
-    printf '    "%s": { "commit": "%s", "describe": "%s" }' "$1" "$(git -C "$repo_root/$2" rev-parse HEAD)" "$(git -C "$repo_root/$2" describe --tags --always)"
+    printf '    "%s": { "commit": "%s", "describe": "%s" }' "$1" "$(git -C "$repo_root/$2" rev-parse HEAD)" "$(describe_source "$2")"
 }
 {
     printf '{\n  "version": "%s",\n  "emscripten": "%s",\n  "flags": "%s",\n  "sources": {\n' "$tag" "$emscripten_version" "$flags"
@@ -162,7 +179,7 @@ url_reference() {
     printf 'Built with Emscripten %s and `%s`, for the .NET browser runtime of the same Emscripten.\n\n' "$emscripten_version" "$flags"
     printf '| Library | Source |\n|---|---|\n'
     for name in SDL SDL_image SDL_mixer SDL_ttf; do
-        printf '| %s | `%s` |\n' "$name" "$(git -C "$repo_root/external/$name" describe --tags --always)"
+        printf '| %s | `%s` |\n' "$name" "$(describe_source "external/$name")"
     done
     printf '| FreeType, HarfBuzz, plutosvg, plutovg | vendored by SDL_ttf, commits in `versions.json` |\n\n'
     printf 'Licenses: `LICENSE-*.txt` for each library, and `THIRD-PARTY-NOTICES.txt` for third-party code compiled into them. %s\n\n' "$freetype_acknowledgment"

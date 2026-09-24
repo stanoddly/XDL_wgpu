@@ -16,10 +16,11 @@ jobs:
   release:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      GH_TOKEN: ${{ github.token }}
+    # The write token goes only to the steps that talk to GitHub, not to the build, the downloads and npm.
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # SDL_image's and SDL_mixer's own submodules are not needed: their codecs are built in (see XDL_BUILD_SDL_LIBRARIES).
       - name: Check out the pinned libraries
@@ -32,9 +33,11 @@ jobs:
 
       # A tag without a release counts too: gh release create would attach the assets to that tag's commit, not to this one.
       - name: Stop if the tag exists
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # A separate assignment, so a failed ls-remote fails the step (bash -e) instead of reading as no tag.
-          existing=$(git ls-remote --tags origin "refs/tags/$TAG")
+          # A separate assignment, so a failed lookup fails the step (bash -e) instead of reading as no tag.
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq ".[] | select(.ref == \"refs/tags/$TAG\") | .ref")
           if [ -n "$existing" ]; then
             echo "::error::Tag $TAG already exists."
             exit 1
@@ -54,14 +57,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers
           mkdir -p build/node
-          (cd build/node && npm init -y > /dev/null && npm install playwright-core --no-audit --no-fund)
+          (cd build/node && npm init -y > /dev/null && npm install playwright-core@1.63.0 --no-audit --no-fund)
           build/node/node_modules/.bin/playwright-core install --with-deps chromium
 
       - name: Build and run the smoke test
         run: |
           source tools/emsdk-env.sh
           emcmake cmake -S . -B build/out -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/out --parallel
+          cmake --build build/out --parallel "$(nproc)"
           tools/run-test.sh
 
       - name: Build the release assets
@@ -76,6 +79,8 @@ jobs:
           node test/dotnet/run.mjs test/dotnet/bin/Release/net11.0/publish/wwwroot
 
       - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd build/release-assets
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file release-notes.md -- *.a *.h *.txt versions.json SHA256SUMS
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --notes-file release-notes.md -- *.a *.h *.txt versions.json SHA256SUMS
