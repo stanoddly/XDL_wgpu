@@ -120,13 +120,13 @@ The link also writes `build/out/test/test.map` and traces `SDL_CreateGPUDevice` 
 
 ## Releases
 
-The [Release workflow](.github/workflows/release.yml) is started by hand. It builds the archives with the Emscripten of the .NET 11 `wasm-tools` workload and the runtime's flags (`-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0`), runs the smoke test, links the archives into a .NET browser app (`test/dotnet`) and publishes a GitHub release. `tools/build-release.sh <tag> <owner/repo>` does the build and staging locally: it configures `build/release` from scratch and replaces `build/release-assets`.
+The [Build workflow](.github/workflows/build.yml) runs on every pull request. It builds the archives with the Emscripten of the .NET 11 `wasm-tools` workload and the runtime's flags (`-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0`), runs the smoke test and links the archives into a .NET browser app (`test/dotnet`). The [Release workflow](.github/workflows/release.yml) is started by hand; it runs Build and publishes its archives as a GitHub release. [MAINTAINING.md](MAINTAINING.md) describes releasing and updating the libraries and the toolchain. `tools/build-release.sh <tag> <owner/repo>` does the build and staging locally: it configures `build/release` from scratch and replaces `build/release-assets`.
 
 - The version is the released commit's UTC commit time, `vYYYYMMDD.HHMMSS`, as Dawn tags its releases. A run stops when the tag exists, so a second run for the same commit publishes nothing.
 - Assets: `libXDL_wgpu.a`, `SDL3.a`, `SDL3_image.a`, `SDL3_mixer.a`, `SDL3_ttf.a`, SDL_ttf's `libfreetype.a`, `libharfbuzz.a`, `libplutosvg.a` and `libplutovg.a`, `XDL_wgpu.h`, each library's license (`LICENSE-*.txt`), `THIRD-PARTY-NOTICES.txt`, `versions.json` (Emscripten version, flags and the commit of every source) and `SHA256SUMS`.
 - Library versions: SDL `release-3.4.16`, SDL_image `release-3.4.6`, SDL_mixer `release-3.2.4`, SDL_ttf `release-3.2.2`, each a submodule under `external/`.
 - SDL_image loads ANI, BMP, GIF, JPEG (stb_image), LBM, PCX, PNG (SDL's codec), PNM, QOI, SVG, TGA, XCF, XPM and XV; AVIF, JXL, TIFF and WebP are off. SDL_mixer plays WAVE, AIFF, VOC, AU, FLAC (dr_flac), MP3 (dr_mp3), Ogg Vorbis (stb_vorbis) and MIDI (TiMidity); Opus, MOD, GME and WavPack are off.
-- `THIRD-PARTY-NOTICES.txt` holds the FreeType acknowledgment; the notices of third-party code compiled into the libraries that their own licenses do not cover, copied verbatim from the pinned sources; and, per library, every distinct copyright line of the sources and headers the compilers read (from the `.o.d` files under `build/release`), which licenses such as HarfBuzz's ask to keep and which a summary such as HarfBuzz's `COPYING` does not list in full. The build fails when a notice is missing or empty. After updating a submodule, search the compiled sources and headers for new license texts and references to Unicode data, and add their notices to `tools/build-release.sh`; the copyright lines follow by themselves. `LICENSES/Unicode-3.0.txt` is a copy of the Unicode license, which no pinned source carries.
+- `THIRD-PARTY-NOTICES.txt` holds the FreeType acknowledgment; the notices of third-party code compiled into the libraries that their own licenses do not cover, copied verbatim from the pinned sources; and, per library, every distinct copyright line of the sources and headers the compilers read (from the `.o.d` files under `build/release`), which licenses such as HarfBuzz's ask to keep and which a summary such as HarfBuzz's `COPYING` does not list in full. The build fails when a notice is missing or empty. After updating a submodule, look for new license texts as MAINTAINING.md describes; the copyright lines follow by themselves. `LICENSES/Unicode-3.0.txt` is a copy of the Unicode license, which no pinned source carries.
 - The release notes list every archive as a Pixely `NativeUrlReference` with its SHA-256, in link order.
 
 ## Using from .NET (browser-wasm)
@@ -158,7 +158,8 @@ The release archives are built for this. To build them yourself, use the same ex
 | `tools/` | Emscripten environment, test runner and release build scripts |
 | `external/SDL` | SDL submodule at `release-3.4.16` |
 | `external/SDL_image`, `external/SDL_mixer`, `external/SDL_ttf` | Submodules at `release-3.4.6`, `release-3.2.4` and `release-3.2.2`, built with `XDL_BUILD_SDL_LIBRARIES` |
-| `.github/workflows/release.yml` | The release workflow |
+| `.github/workflows/build.yml`, `.github/workflows/release.yml` | The build-and-test workflow for pull requests and releases, and the release workflow |
+| `MAINTAINING.md` | Releasing, and updating the pinned libraries and the toolchain |
 | `LICENSES/Unicode-3.0.txt` | The Unicode license, for HarfBuzz's tables generated from Unicode data |
 
 ## Changes to the backend
