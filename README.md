@@ -143,7 +143,7 @@ Reference the archives with `NativeFileReference`, XDL_wgpu first. Keep the stoc
 </PropertyGroup>
 ```
 
-`tools/native-references.sh [--file <dir> | --url] [tag]` prints the archives of a release, the latest without a tag, as MSBuild items in link order. `--file <dir>` (the default, with `<dir>` = `native`) downloads them into `<dir>`, checks their SHA-256 and prints these `NativeFileReference` items with absolute paths; `--url` prints `NativeUrlReference` items with each archive's URL and SHA-256 instead, for a custom MSBuild target that downloads them. It needs `gh`, authenticated while the repository is private.
+`tools/native-references.sh [--file <dir> | --url] [tag]` prints the archives of a release, the latest without a tag, as MSBuild items in link order. `--file <dir>` (the default, with `<dir>` = `native`) downloads them into `<dir>`, checks their SHA-256 and prints these `NativeFileReference` items with absolute paths; `--url` prints `NativeUrlReference` items with each archive's URL and SHA-256 instead, for a custom MSBuild target that downloads them. The absolute paths are for your machine only; commit the items with paths relative to the project instead. It needs `gh`, authenticated while the repository is private.
 
 The release archives are built for this. To build them yourself, use the same exception flags as the runtime (`-DXDL_EMSCRIPTEN_FLAGS="-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0"`). Since the .NET runtime does not use asyncify, create the device through the adopt path and use the non-blocking per-frame calls described above.
 
