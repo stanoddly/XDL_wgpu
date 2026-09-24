@@ -55,7 +55,7 @@ Expected last line: `XDL_wgpu link test PASSED`. Keep `WasmCachePath` apart from
    tools/build-release.sh vTEST owner/repo
    cp build/release-assets/THIRD-PARTY-NOTICES.txt build/notices-before.txt
    xargs grep -l -i -E "licen[cs]e|copyright|permission to use|permission is hereby|freely granted|public domain|unicode\.org" \
-     < build/release/compiled-sources.txt | sed "s|$PWD/||" | sort > build/license-files-before.txt
+     < build/release/compiled-sources.txt | sed "s|^$(pwd -P)/||" | sort > build/license-files-before.txt
    ```
 
 2. Move the submodule to the new release tag:
