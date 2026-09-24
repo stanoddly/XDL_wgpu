@@ -47,30 +47,63 @@ cp "$repo_root/external/SDL_ttf/external/plutovg/LICENSE" "$out_dir/LICENSE-plut
 freetype_year=$(grep -m1 -oE 'Copyright \(C\) 1996-[0-9]{4}' "$repo_root/external/SDL_ttf/external/freetype/include/freetype/freetype.h" | grep -oE '[0-9]{4}$')
 freetype_acknowledgment="Portions of this software are copyright © $freetype_year The FreeType Project (www.freetype.org). All rights reserved."
 
-# Copies a notice verbatim from the pinned source, from the first line matching <start> through the next line matching <end>. A notice
-# that is not found fails the build, so a library update cannot drop one silently.
-notice() {
-    local text
-    if ! text=$(NOTICE_START=$3 NOTICE_END=$4 awk '!found && $0 ~ ENVIRON["NOTICE_START"] { found = 1 } found { print } found && $0 ~ ENVIRON["NOTICE_END"] { done = 1; exit } END { exit !done }' "$repo_root/$2"); then
-        echo "build-release: the notice of $1 is missing from $2" >&2
+# Writes one section of THIRD-PARTY-NOTICES.txt. An empty text fails the build like a missing one, so a library update cannot drop a
+# notice silently.
+section() {
+    if [ -z "${3//[[:space:]]/}" ]; then
+        echo "build-release: the notice of $1 is missing or empty in $2" >&2
         exit 1
     fi
-    printf '==== %s (%s)\n\n%s\n\n' "$1" "$2" "$text"
+    printf '==== %s (%s)\n\n%s\n\n' "$1" "$2" "$3"
+}
+# Copies a notice verbatim from the pinned source, from the first line matching <start> through the next line matching <end>.
+notice() {
+    local text=""
+    text=$(NOTICE_START=$3 NOTICE_END=$4 awk '!found && $0 ~ ENVIRON["NOTICE_START"] { found = 1 } found { print } found && $0 ~ ENVIRON["NOTICE_END"] { done = 1; exit } END { exit !done }' "$repo_root/$2") || text=""
+    section "$1" "$2" "$text"
 }
 notice_file() {
-    local text
-    if ! text=$(cat "$repo_root/$2"); then
-        echo "build-release: the notice of $1 is missing: $2" >&2
-        exit 1
-    fi
-    printf '==== %s (%s)\n\n%s\n\n' "$1" "$2" "$text"
+    local text=""
+    text=$(cat "$repo_root/$2") || text=""
+    section "$1" "$2" "$text"
 }
-# Notices of code compiled into the archives beyond each library's own license, found with a search of every compiled source and
-# header (the .o.d files under build/release) for copyright lines, license texts and references to Unicode data. Public-domain code and zlib-licensed code, whose license asks for no notice in a binary, are not listed.
+
+# Every source and header the compilers read for the archives, from their dependency files, outside the build directory.
+repo_real=$(realpath "$repo_root")
+find "$build_dir" -name '*.o.d' -exec cat {} + | tr -s ' \\\t' '\n\n\n' | grep '^/' | sort -u | xargs realpath -m -- | grep "^$repo_real/" | grep -v "^$repo_real/build/" | sort -u > "$build_dir/compiled-sources.txt"
+# The copyright lines of the given files, without comment decoration. A line ending in "by", or with years but no holder, continues
+# with the holder on the next line.
+# Lines with a double quote are string literals and documentation examples, not notices.
+copyright_lines() {
+    xargs -r awk '
+        function clean(s) { sub(/^[[:space:]\/*#|]+/, "", s); sub(/[[:space:]\/*|]+$/, "", s); gsub(/[[:space:]]+/, " ", s); return s }
+        pending != "" { print pending " " clean($0); pending = ""; next }
+        tolower($0) ~ /copyright[[:space:]]*(\(c\)|©|[0-9][0-9][0-9][0-9])/ && $0 !~ /"/ {
+            line = clean($0)
+            holder = line
+            sub(/^[Cc][Oo][Pp][Yy][Rr][Ii][Gg][Hh][Tt][[:space:]]*(\([Cc]\)|©)?/, "", holder)
+            if (line ~ / by$/ || holder !~ /[A-Za-z]/) { pending = line } else { print line }
+        }' | sort -u
+}
+# The copyright lines of one library's compiled files: the notices its license asks to keep, which a summary such as HarfBuzz's COPYING
+# does not list in full.
+library_copyrights() {
+    local files="" text=""
+    files=$(grep "^$repo_real/$3" "$build_dir/compiled-sources.txt") || files=""
+    if [ -n "${4:-}" ]; then
+        files=$(printf '%s\n' "$files" | grep -v "^$repo_real/$4") || files=""
+    fi
+    text=$(printf '%s\n' "$files" | copyright_lines) || text=""
+    section "Copyright lines of $1, licensed under $2" "every distinct copyright line in its sources and headers compiled into this release" "$text"
+}
+
 {
-    printf 'Notices of third-party code compiled into the archives of this release, copied from the sources in versions.json.\n'
-    printf 'The licenses of the libraries themselves are in the LICENSE-*.txt files.\n\n'
+    printf 'Notices for the archives of this release, from the sources in versions.json. The license of each library is in its LICENSE-*.txt file.\n'
+    printf 'Below are the FreeType acknowledgment, the notices of third-party code whose license the library'"'"'s own does not cover, and the\n'
+    printf 'copyright lines of every source and header compiled into each library.\n\n'
     printf '==== FreeType (libfreetype.a)\n\n%s\n\n' "$freetype_acknowledgment"
+    # Found with a search of every compiled source and header for copyright lines, license texts and references to Unicode data.
+    # Public-domain code and zlib-licensed code, whose license asks for no notice in a binary, are not listed.
     notice "SDL: math functions from Sun's libm (SDL3.a)" external/SDL/src/libm/e_atan2.c 'Copyright \(C\) 1993 by Sun Microsystems' 'is preserved\.'
     notice_file "SDL: YUV to RGB conversion (SDL3.a)" external/SDL/src/video/yuv2rgb/LICENSE
     notice "SDL: keysym to UCS conversion (SDL3.a)" external/SDL/src/events/imKStoUCS.c 'Copyright \(C\) 2003-2006,2008 Jamey Sharp' 'DEALINGS IN THE SOFTWARE\.$'
@@ -86,6 +119,16 @@ notice_file() {
     # No pinned source carries the license of the Unicode data HarfBuzz generates its tables from (hb-ucd-table.hh, hb-unicode-emoji-table.hh,
     # the shaper tables), so the repository keeps a copy of https://www.unicode.org/license.txt.
     notice_file "HarfBuzz: tables generated from Unicode data (libharfbuzz.a)" LICENSES/Unicode-3.0.txt
+
+    library_copyrights "XDL_wgpu (libXDL_wgpu.a)" LICENSE-XDL_wgpu.txt "src/"
+    library_copyrights "SDL (SDL3.a)" LICENSE-SDL.txt "external/SDL/"
+    library_copyrights "SDL_image (SDL3_image.a)" LICENSE-SDL_image.txt "external/SDL_image/"
+    library_copyrights "SDL_mixer (SDL3_mixer.a)" LICENSE-SDL_mixer.txt "external/SDL_mixer/"
+    library_copyrights "SDL_ttf (SDL3_ttf.a)" LICENSE-SDL_ttf.txt "external/SDL_ttf/" "external/SDL_ttf/external/"
+    library_copyrights "FreeType (libfreetype.a)" LICENSE-freetype.txt "external/SDL_ttf/external/freetype/"
+    library_copyrights "HarfBuzz (libharfbuzz.a)" LICENSE-harfbuzz.txt "external/SDL_ttf/external/harfbuzz/"
+    library_copyrights "plutosvg (libplutosvg.a)" LICENSE-plutosvg.txt "external/SDL_ttf/external/plutosvg/"
+    library_copyrights "plutovg (libplutovg.a)" LICENSE-plutovg.txt "external/SDL_ttf/external/plutovg/"
 } > "$out_dir/THIRD-PARTY-NOTICES.txt"
 
 emscripten_version=$(emcc --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
