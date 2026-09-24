@@ -58,10 +58,15 @@ notice() {
     printf '==== %s (%s)\n\n%s\n\n' "$1" "$2" "$text"
 }
 notice_file() {
-    printf '==== %s (%s)\n\n%s\n\n' "$1" "$2" "$(cat "$repo_root/$2")"
+    local text
+    if ! text=$(cat "$repo_root/$2"); then
+        echo "build-release: the notice of $1 is missing: $2" >&2
+        exit 1
+    fi
+    printf '==== %s (%s)\n\n%s\n\n' "$1" "$2" "$text"
 }
 # Notices of code compiled into the archives beyond each library's own license, found with a search of every compiled source and
-# header for copyright lines. Public-domain code and zlib-licensed code, whose license asks for no notice in a binary, are not listed.
+# header (the .o.d files under build/release) for copyright lines, license texts and references to Unicode data. Public-domain code and zlib-licensed code, whose license asks for no notice in a binary, are not listed.
 {
     printf 'Notices of third-party code compiled into the archives of this release, copied from the sources in versions.json.\n'
     printf 'The licenses of the libraries themselves are in the LICENSE-*.txt files.\n\n'
@@ -76,6 +81,11 @@ notice_file() {
     notice "FreeType: PCF bitmap utilities (libfreetype.a)" external/SDL_ttf/external/freetype/src/pcf/pcfutil.c 'Copyright 1990, 1994, 1998  The Open Group' 'written authorization from The Open Group\.'
     notice "FreeType: HarfBuzz glue of the auto-hinter (libfreetype.a)" external/SDL_ttf/external/freetype/src/autofit/ft-hb.c 'Copyright © 2009, 2023  Red Hat' 'OR MODIFICATIONS\.$'
     notice_file "HarfBuzz: Universal Shaping Engine data (libharfbuzz.a)" external/SDL_ttf/external/harfbuzz/src/ms-use/COPYING
+    notice "HarfBuzz: Unicode character database functions (libharfbuzz.a)" external/SDL_ttf/external/harfbuzz/src/hb-ucd.cc 'Copyright \(C\) 2012 Grigori Goronzy' 'USE OR PERFORMANCE OF THIS SOFTWARE\.'
+    notice "HarfBuzz: fasthash (libharfbuzz.a)" external/SDL_ttf/external/harfbuzz/src/hb-algs.hh 'Copyright \(C\) 2012 Zilong Tan' '^   SOFTWARE\.$'
+    # No pinned source carries the license of the Unicode data HarfBuzz generates its tables from (hb-ucd-table.hh, hb-unicode-emoji-table.hh,
+    # the shaper tables), so the repository keeps a copy of https://www.unicode.org/license.txt.
+    notice_file "HarfBuzz: tables generated from Unicode data (libharfbuzz.a)" LICENSES/Unicode-3.0.txt
 } > "$out_dir/THIRD-PARTY-NOTICES.txt"
 
 emscripten_version=$(emcc --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)

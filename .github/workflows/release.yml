@@ -33,7 +33,9 @@ jobs:
       # A tag without a release counts too: gh release create would attach the assets to that tag's commit, not to this one.
       - name: Stop if the tag exists
         run: |
-          if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+          # A separate assignment, so a failed ls-remote fails the step (bash -e) instead of reading as no tag.
+          existing=$(git ls-remote --tags origin "refs/tags/$TAG")
+          if [ -n "$existing" ]; then
             echo "::error::Tag $TAG already exists."
             exit 1
           fi
