@@ -30,10 +30,11 @@ jobs:
       - name: Compute the tag
         run: echo "TAG=$(TZ=UTC git log -1 --date=format-local:%Y%m%d.%H%M%S --format=v%cd)" >> "$GITHUB_ENV"
 
-      - name: Stop if this commit is released
+      # A tag without a release counts too: gh release create would attach the assets to that tag's commit, not to this one.
+      - name: Stop if the tag exists
         run: |
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            echo "::error::Release $TAG already exists."
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+            echo "::error::Tag $TAG already exists."
             exit 1
           fi
 

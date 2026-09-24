@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Builds the release archives with the .NET browser runtime's exception flags and stages them with the header, the licenses,
-# versions.json, SHA256SUMS and release-notes.md.
-# Usage: tools/build-release.sh <tag> <owner/repo> [out-dir]   (emcc on PATH, for example from tools/emsdk-env.sh)
+# Builds the release archives with the .NET browser runtime's exception flags and stages them in build/release-assets with the
+# header, the licenses, THIRD-PARTY-NOTICES.txt, versions.json, SHA256SUMS and release-notes.md.
+# Usage: tools/build-release.sh <tag> <owner/repo>   (emcc on PATH, for example from tools/emsdk-env.sh)
 set -euo pipefail
 
 tag=$1
 repository=$2
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-out_dir=${3:-$repo_root/build/release-assets}
+out_dir=$repo_root/build/release-assets
 build_dir=$repo_root/build/release
 flags="-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0"
 
+# A fresh configure, so the archives come from the emcc on PATH that versions.json names, not from a compiler an older configure cached.
+rm -rf "$build_dir"
 emcmake cmake -S "$repo_root" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DXDL_BUILD_TEST=OFF -DXDL_BUILD_SDL_LIBRARIES=ON -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$flags"
 cmake --build "$build_dir" --parallel --target XDL_wgpu SDL3-static SDL3_image-static SDL3_mixer-static SDL3_ttf-static freetype harfbuzz plutosvg plutovg
 
@@ -41,6 +43,40 @@ cp "$repo_root/external/SDL_ttf/external/freetype/docs/FTL.TXT" "$out_dir/LICENS
 cp "$repo_root/external/SDL_ttf/external/harfbuzz/COPYING" "$out_dir/LICENSE-harfbuzz.txt"
 cp "$repo_root/external/SDL_ttf/external/plutosvg/LICENSE" "$out_dir/LICENSE-plutosvg.txt"
 cp "$repo_root/external/SDL_ttf/external/plutovg/LICENSE" "$out_dir/LICENSE-plutovg.txt"
+
+freetype_year=$(grep -m1 -oE 'Copyright \(C\) 1996-[0-9]{4}' "$repo_root/external/SDL_ttf/external/freetype/include/freetype/freetype.h" | grep -oE '[0-9]{4}$')
+freetype_acknowledgment="Portions of this software are copyright © $freetype_year The FreeType Project (www.freetype.org). All rights reserved."
+
+# Copies a notice verbatim from the pinned source, from the first line matching <start> through the next line matching <end>. A notice
+# that is not found fails the build, so a library update cannot drop one silently.
+notice() {
+    local text
+    if ! text=$(NOTICE_START=$3 NOTICE_END=$4 awk '!found && $0 ~ ENVIRON["NOTICE_START"] { found = 1 } found { print } found && $0 ~ ENVIRON["NOTICE_END"] { done = 1; exit } END { exit !done }' "$repo_root/$2"); then
+        echo "build-release: the notice of $1 is missing from $2" >&2
+        exit 1
+    fi
+    printf '==== %s (%s)\n\n%s\n\n' "$1" "$2" "$text"
+}
+notice_file() {
+    printf '==== %s (%s)\n\n%s\n\n' "$1" "$2" "$(cat "$repo_root/$2")"
+}
+# Notices of code compiled into the archives beyond each library's own license, found with a search of every compiled source and
+# header for copyright lines. Public-domain code and zlib-licensed code, whose license asks for no notice in a binary, are not listed.
+{
+    printf 'Notices of third-party code compiled into the archives of this release, copied from the sources in versions.json.\n'
+    printf 'The licenses of the libraries themselves are in the LICENSE-*.txt files.\n\n'
+    printf '==== FreeType (libfreetype.a)\n\n%s\n\n' "$freetype_acknowledgment"
+    notice "SDL: math functions from Sun's libm (SDL3.a)" external/SDL/src/libm/e_atan2.c 'Copyright \(C\) 1993 by Sun Microsystems' 'is preserved\.'
+    notice_file "SDL: YUV to RGB conversion (SDL3.a)" external/SDL/src/video/yuv2rgb/LICENSE
+    notice "SDL: keysym to UCS conversion (SDL3.a)" external/SDL/src/events/imKStoUCS.c 'Copyright \(C\) 2003-2006,2008 Jamey Sharp' 'DEALINGS IN THE SOFTWARE\.$'
+    notice "SDL_image: GIF decoder adapted from XPaint (SDL3_image.a)" external/SDL_image/src/IMG_gif.c 'Copyright 1990, 1991, 1993 David Koblas' 'provided "as is"'
+    notice "SDL_image: QOI codec (SDL3_image.a)" external/SDL_image/src/qoi.h 'Copyright\(c\) 2021 Dominic Szablewski' '^SOFTWARE\.$'
+    notice "FreeType: BDF driver (libfreetype.a)" external/SDL_ttf/external/freetype/src/bdf/README '^License$' '^THE USE OR OTHER DEALINGS IN THE SOFTWARE\.$'
+    notice "FreeType: PCF driver (libfreetype.a)" external/SDL_ttf/external/freetype/src/pcf/README '^License$' '^SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE\.$'
+    notice "FreeType: PCF bitmap utilities (libfreetype.a)" external/SDL_ttf/external/freetype/src/pcf/pcfutil.c 'Copyright 1990, 1994, 1998  The Open Group' 'written authorization from The Open Group\.'
+    notice "FreeType: HarfBuzz glue of the auto-hinter (libfreetype.a)" external/SDL_ttf/external/freetype/src/autofit/ft-hb.c 'Copyright © 2009, 2023  Red Hat' 'OR MODIFICATIONS\.$'
+    notice_file "HarfBuzz: Universal Shaping Engine data (libharfbuzz.a)" external/SDL_ttf/external/harfbuzz/src/ms-use/COPYING
+} > "$out_dir/THIRD-PARTY-NOTICES.txt"
 
 emscripten_version=$(emcc --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 source_entry() {
@@ -76,6 +112,7 @@ url_reference() {
         printf '| %s | `%s` |\n' "$name" "$(git -C "$repo_root/external/$name" describe --tags --always)"
     done
     printf '| FreeType, HarfBuzz, plutosvg, plutovg | vendored by SDL_ttf, commits in `versions.json` |\n\n'
+    printf 'Licenses: `LICENSE-*.txt` for each library, and `THIRD-PARTY-NOTICES.txt` for third-party code compiled into them. %s\n\n' "$freetype_acknowledgment"
     printf 'Pixely (`NativeUrlReference`), in this order:\n\n```xml\n<ItemGroup>\n'
     url_reference libXDL_wgpu.a ' ScanForPInvokes="false"'
     for archive in SDL3.a SDL3_image.a SDL3_mixer.a SDL3_ttf.a; do

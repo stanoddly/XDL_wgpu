@@ -120,12 +120,13 @@ The link also writes `build/out/test/test.map` and traces `SDL_CreateGPUDevice` 
 
 ## Releases
 
-The [Release workflow](.github/workflows/release.yml) is started by hand. It builds the archives with the Emscripten of the .NET 11 `wasm-tools` workload and the runtime's flags (`-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0`), runs the smoke test, links the archives into a .NET browser app (`test/dotnet`) and publishes a GitHub release. `tools/build-release.sh <tag> <owner/repo>` does the build and staging locally, into `build/release-assets`.
+The [Release workflow](.github/workflows/release.yml) is started by hand. It builds the archives with the Emscripten of the .NET 11 `wasm-tools` workload and the runtime's flags (`-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0`), runs the smoke test, links the archives into a .NET browser app (`test/dotnet`) and publishes a GitHub release. `tools/build-release.sh <tag> <owner/repo>` does the build and staging locally: it configures `build/release` from scratch and replaces `build/release-assets`.
 
-- The version is the released commit's UTC commit time, `vYYYYMMDD.HHMMSS`, as Dawn tags its releases. A second run for the same commit stops at the existing release.
-- Assets: `libXDL_wgpu.a`, `SDL3.a`, `SDL3_image.a`, `SDL3_mixer.a`, `SDL3_ttf.a`, SDL_ttf's `libfreetype.a`, `libharfbuzz.a`, `libplutosvg.a` and `libplutovg.a`, `XDL_wgpu.h`, the license of every library, `versions.json` (Emscripten version, flags and the commit of every source) and `SHA256SUMS`.
+- The version is the released commit's UTC commit time, `vYYYYMMDD.HHMMSS`, as Dawn tags its releases. A run stops when the tag exists, so a second run for the same commit publishes nothing.
+- Assets: `libXDL_wgpu.a`, `SDL3.a`, `SDL3_image.a`, `SDL3_mixer.a`, `SDL3_ttf.a`, SDL_ttf's `libfreetype.a`, `libharfbuzz.a`, `libplutosvg.a` and `libplutovg.a`, `XDL_wgpu.h`, each library's license (`LICENSE-*.txt`), `THIRD-PARTY-NOTICES.txt`, `versions.json` (Emscripten version, flags and the commit of every source) and `SHA256SUMS`.
 - Library versions: SDL `release-3.4.16`, SDL_image `release-3.4.6`, SDL_mixer `release-3.2.4`, SDL_ttf `release-3.2.2`, each a submodule under `external/`.
 - SDL_image loads ANI, BMP, GIF, JPEG (stb_image), LBM, PCX, PNG (SDL's codec), PNM, QOI, SVG, TGA, XCF, XPM and XV; AVIF, JXL, TIFF and WebP are off. SDL_mixer plays WAVE, AIFF, VOC, AU, FLAC (dr_flac), MP3 (dr_mp3), Ogg Vorbis (stb_vorbis) and MIDI (TiMidity); Opus, MOD, GME and WavPack are off.
+- `THIRD-PARTY-NOTICES.txt` holds the FreeType acknowledgment and the notices of third-party code compiled into the libraries that their own licenses do not cover, copied verbatim from the pinned sources. The build fails when a notice is no longer found. After updating a submodule, search the compiled sources and headers (the `.o.d` files under `build/release`) for new copyright lines and add their notices to `tools/build-release.sh`.
 - The release notes list every asset as a Pixely `NativeUrlReference` with its SHA-256, in link order.
 
 ## Using from .NET (browser-wasm)
