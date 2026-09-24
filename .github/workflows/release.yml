@@ -1,0 +1,67 @@
+name: Release
+
+# Started by hand. The tag is the released commit's UTC commit time (vYYYYMMDD.HHMMSS), so a second run for the same commit stops
+# at the existing tag instead of publishing a duplicate. The assets come from the Build workflow, the one pull requests run.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Compute the tag
+        id: tag
+        run: echo "tag=$(TZ=UTC git log -1 --date=format-local:%Y%m%d.%H%M%S --format=v%cd)" >> "$GITHUB_OUTPUT"
+
+      # A tag without a release counts too: gh release create would attach the assets to that tag's commit, not to this one.
+      - name: Stop if the tag exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # A separate assignment, so a failed lookup fails the step (bash -e) instead of reading as no tag.
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq ".[] | select(.ref == \"refs/tags/$TAG\") | .ref")
+          if [ -n "$existing" ]; then
+            echo "::error::Tag $TAG already exists."
+            exit 1
+          fi
+
+  build:
+    needs: tag
+    uses: ./.github/workflows/build.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
+
+  # The only job with the write token; it runs no build tools.
+  publish:
+    needs: [tag, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Publish the release
+        working-directory: release-assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag.outputs.tag }}
+        run: gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --notes-file release-notes.md -- *.a *.h *.txt versions.json SHA256SUMS
