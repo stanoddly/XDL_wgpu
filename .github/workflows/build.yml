@@ -7,7 +7,7 @@ on:
   workflow_call:
     inputs:
       tag:
-        description: The release tag, written into versions.json and the release notes.
+        description: The release tag, written into the release notes.
         required: true
         type: string
 

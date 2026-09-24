@@ -9,14 +9,14 @@ How to release, test, and update the pinned libraries and the toolchain. [README
 | [Build](.github/workflows/build.yml) | On every pull request to `main`, and inside Release | Checks out the pinned libraries, installs the .NET 11 preview SDK and its `wasm-tools` workload, runs the Chromium smoke test, builds the release assets with `tools/build-release.sh`, links them into the .NET browser app in `test/dotnet`, and uploads them as the `release-assets` artifact |
 | [Release](.github/workflows/release.yml) | By hand | Computes the tag, stops if it exists, runs Build, and publishes the artifact as a GitHub release. Only its last job has a token that can write |
 
-A pull request's `release-assets` artifact is a preview: the archives are the ones a release of the merged commit would publish, so they can be downloaded and tried before merging. Its tag is the placeholder `pr-<number>`, and `versions.json` names GitHub's test merge commit, so its release notes and version information are not final.
+A pull request's `release-assets` artifact is a preview: the archives are the ones a release of the merged commit would publish, so they can be downloaded and tried before merging. Its tag is the placeholder `pr-<number>`, and its `release-notes.md` names GitHub's test merge commit, so its release notes are not final.
 
 ## Release
 
 1. Merge the pull request to `main`.
 2. In GitHub: Actions → Release → Run workflow, on `main`.
 3. The tag is the released commit's UTC commit time, `vYYYYMMDD.HHMMSS`. A commit can be released once; a second run stops at the existing tag. To release again, commit something.
-4. The release notes list each archive as a Pixely `NativeUrlReference` with its SHA-256. They download without credentials only when the repository is public.
+4. The release notes list the Emscripten version, the flags, and the archives in link order with each library's version and commit. `tools/native-references.sh` prints a release's archives as MSBuild items. The archives download without credentials only when the repository is public.
 
 A failed run publishes nothing. Fix the cause on a branch and run Release again after merging.
 
@@ -76,7 +76,7 @@ Expected last line: `XDL_wgpu link test PASSED`. Keep `WasmCachePath` apart from
    diff build/license-files-before.txt build/license-files-after.txt
    ```
 
-   The copyright lines in `THIRD-PARTY-NOTICES.txt` follow by themselves, and every compiled file's copyright holders are listed there. A new holder or a new file with a license text points to code to read. If its license asks to keep its notice or permission text in copies or documentation, and the library's own `LICENSE-*.txt` does not cover it, add a `notice` or `notice_file` entry to `tools/build-release.sh`. Public-domain code and zlib-licensed code need no entry; their licenses ask for no notice in a binary. Code derived from Unicode data (tables generated from the Unicode Character Database or emoji data) is covered by `LICENSES/Unicode-3.0.txt`; extend that entry's title if a new library has such tables.
+   The copyright lines in `THIRD-PARTY-NOTICES.txt` follow by themselves, and every compiled file's copyright holders are listed there. A new holder or a new file with a license text points to code to read. If its license asks to keep its notice or permission text in copies or documentation, and the library's own license does not cover it, add a `notice` or `notice_file` entry to `tools/build-release.sh`. Public-domain code and zlib-licensed code need no entry; their licenses ask for no notice in a binary. Code derived from Unicode data (tables generated from the Unicode Character Database or emoji data) is covered by `LICENSES/Unicode-3.0.txt`; extend that entry's title if a new library has such tables.
 5. Run the .NET link test.
 6. Update the versions in README: Releases ("Library versions") and the Layout table.
 7. Commit the submodule and open a pull request. Build runs on it.
@@ -92,11 +92,11 @@ As above, and also:
 
 ## Change the codecs
 
-The codecs of SDL_image and SDL_mixer are the `set(SDLIMAGE_…)` and `set(SDLMIXER_…)` lines under `XDL_BUILD_SDL_LIBRARIES` in `CMakeLists.txt`. The build uses only codecs that need no extra library, so each release has nine archives. A codec that needs a library (libwebp, libopus and others) needs the library's submodule, its archive in `tools/build-release.sh`, the test project and the release notes, and its license. Update the codec lists in README, Releases.
+The codecs of SDL_image and SDL_mixer are the `set(SDLIMAGE_…)` and `set(SDLMIXER_…)` lines under `XDL_BUILD_SDL_LIBRARIES` in `CMakeLists.txt`. The build uses only codecs that need no extra library, so each release has five archives. A codec that needs a library (libwebp, libopus and others) needs the library's submodule; its objects in `SDL3_image.a` or `SDL3_mixer.a`, which SDL_image and SDL_mixer do not do by themselves (unlike SDL_ttf, whose archive holds its vendored libraries), so `tools/build-release.sh` has to merge them; its row in the release notes; and its license and copyright lines in `THIRD-PARTY-NOTICES.txt`. Update the codec lists in README, Releases.
 
 ## .NET and Emscripten
 
-- Build installs the newest .NET 11 preview SDK, so its Emscripten can change between two releases without a commit. `versions.json` in each release records the Emscripten version and the flags.
+- Build installs the newest .NET 11 preview SDK, so its Emscripten can change between two releases without a commit. The release notes of each release record the Emscripten version and the flags.
 - The archives link only into a .NET runtime built with the same Emscripten. A new .NET major version needs a new `dotnet-version` in `build.yml` and a new `TargetFramework` in `test/dotnet`.
 - Emscripten pins the Dawn version of the emdawnwebgpu port, so a new Emscripten can change the WebGPU header the backend compiles against. A compile error in `src/SDL_gpu_webgpu.c` after a .NET update is the first sign. Update the Emscripten and Dawn versions in README, Building.
 - The release flags (`-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0`) match the .NET runtime's. If .NET changes its exception handling, change `flags` in `tools/build-release.sh`.
@@ -106,6 +106,6 @@ The codecs of SDL_image and SDL_mixer are the `set(SDLIMAGE_…)` and `set(SDLMI
 | What | Where |
 |---|---|
 | SDL, SDL_image, SDL_mixer, SDL_ttf | Submodules under `external/`; README: SDL version, Releases, Layout, Changes to the backend |
-| FreeType, HarfBuzz, plutosvg, plutovg | SDL_ttf's submodules; `versions.json` of each release |
+| FreeType, HarfBuzz, plutosvg, plutovg | SDL_ttf's submodules; the release notes of each release |
 | Emscripten, Dawn | The .NET workload; README: Building |
 | playwright-core | `build.yml` |
