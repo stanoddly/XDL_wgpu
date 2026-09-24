@@ -9,7 +9,7 @@ How to release, test, and update the pinned libraries and the toolchain. [README
 | [Build](.github/workflows/build.yml) | On every pull request to `main`, and inside Release | Checks out the pinned libraries, installs the .NET 11 preview SDK and its `wasm-tools` workload, runs the Chromium smoke test, builds the release assets with `tools/build-release.sh`, links them into the .NET browser app in `test/dotnet`, and uploads them as the `release-assets` artifact |
 | [Release](.github/workflows/release.yml) | By hand | Computes the tag, stops if it exists, runs Build, and publishes the artifact as a GitHub release. Only its last job has a token that can write |
 
-A pull request's `release-assets` artifact is what a release of that commit would publish, so it can be downloaded and tried before merging.
+A pull request's `release-assets` artifact is a preview: the archives are the ones a release of the merged commit would publish, so they can be downloaded and tried before merging. Its tag is the placeholder `pr-<number>`, and `versions.json` names GitHub's test merge commit, so its release notes and version information are not final.
 
 ## Release
 
@@ -41,15 +41,24 @@ tools/build-release.sh vTEST owner/repo
 Then, in a new shell without `tools/emsdk-env.sh`, the .NET link test:
 
 ```
-dotnet publish test/dotnet -c Release -p:XdlArchiveDirectory="$PWD/build/release-assets" -p:WasmCachePath="$PWD/build/dotnet-em-cache"
-node test/dotnet/run.mjs test/dotnet/bin/Release/net11.0/publish/wwwroot
+dotnet publish test/dotnet -c Release -o build/dotnet-link -p:XdlArchiveDirectory="$PWD/build/release-assets" -p:WasmCachePath="$PWD/build/dotnet-em-cache"
+node test/dotnet/run.mjs build/dotnet-link/wwwroot
 ```
 
 Expected last line: `XDL_wgpu link test PASSED`. Keep `WasmCachePath` apart from `build/em-cache`: a .NET link into the cache that `tools/emsdk-env.sh` uses emptied it once, emdawnwebgpu port included, and the next smoke-test build failed.
 
 ## Update SDL_image, SDL_mixer or SDL_ttf
 
-1. Move the submodule to the new release tag:
+1. Before the update, record the current notices and license texts:
+
+   ```
+   tools/build-release.sh vTEST owner/repo
+   cp build/release-assets/THIRD-PARTY-NOTICES.txt build/notices-before.txt
+   xargs grep -l -i -E "licen[cs]e|copyright|permission to use|permission is hereby|freely granted|public domain|unicode\.org" \
+     < build/release/compiled-sources.txt | sed "s|$PWD/||" | sort > build/license-files-before.txt
+   ```
+
+2. Move the submodule to the new release tag:
 
    ```
    git -C external/SDL_image fetch --tags
@@ -57,26 +66,26 @@ Expected last line: `XDL_wgpu link test PASSED`. Keep `WasmCachePath` apart from
    ```
 
    For SDL_ttf, also update its vendored libraries: `git -C external/SDL_ttf submodule update --init external/freetype external/harfbuzz external/plutosvg external/plutovg`.
-2. Run `tools/build-release.sh vTEST owner/repo`.
+3. Run `tools/build-release.sh vTEST owner/repo` again.
    - If a CMake option changed name, the configure fails or the codec summary (`SDL3_image backends`, `SDL3_mixer backends`) changes. Compare it with the codec lists in README, Releases.
    - If a copied notice moved or changed, the script fails with "the notice of … is missing or empty". Fix its start and end patterns in `tools/build-release.sh`.
-3. Look for new third-party licenses. The copyright lines in `THIRD-PARTY-NOTICES.txt` follow by themselves, but a new license text or new code derived from Unicode data needs its own entry in `tools/build-release.sh`. `build/release/compiled-sources.txt` lists every compiled source and header. This lists the ones with a license text other than their library's standard header:
+4. Look for new third-party licenses. Run the `xargs grep` of step 1 into `build/license-files-after.txt`, then compare:
 
    ```
-   xargs grep -l -i -E "licen[cs]e|permission is hereby|public domain|unicode, inc|unicode\.org" < build/release/compiled-sources.txt \
-     | xargs grep -L -E "Sam Lantinga|the FreeType project|without written agreement and without" | sed "s|$PWD/||" | sort
+   diff build/notices-before.txt build/release-assets/THIRD-PARTY-NOTICES.txt
+   diff build/license-files-before.txt build/license-files-after.txt
    ```
 
-   Save its output before the update and compare it with the output after; review only the new files. At the current pins it lists 83 files, all accounted for: the notices in `tools/build-release.sh`, the libraries' own licenses (plutovg, plutosvg, TiMidity, FreeType's Adobe code under the FreeType License), and public-domain code (stb, dr_libs, miniz, tiny_jpeg). Public-domain code and zlib-licensed code need no entry; their licenses ask for no notice in a binary.
-4. Run the .NET link test.
-5. Update the versions in README: Releases ("Library versions") and the Layout table.
-6. Commit the submodule and open a pull request. Build runs on it.
+   The copyright lines in `THIRD-PARTY-NOTICES.txt` follow by themselves, and every compiled file's copyright holders are listed there. A new holder or a new file with a license text points to code to read. If its license asks to keep its notice or permission text in copies or documentation, and the library's own `LICENSE-*.txt` does not cover it, add a `notice` or `notice_file` entry to `tools/build-release.sh`. Public-domain code and zlib-licensed code need no entry; their licenses ask for no notice in a binary. Code derived from Unicode data (tables generated from the Unicode Character Database or emoji data) is covered by `LICENSES/Unicode-3.0.txt`; extend that entry's title if a new library has such tables.
+5. Run the .NET link test.
+6. Update the versions in README: Releases ("Library versions") and the Layout table.
+7. Commit the submodule and open a pull request. Build runs on it.
 
 ## Update SDL
 
 As above, and also:
 
-1. `src/SDL_gpu.c` and `src/SDL_sysgpu.h` are copies from the pinned SDL with one change each (see README, Layout). Diff them against the new release's `src/gpu/` and carry over its changes.
+1. `src/SDL_gpu.c` and `src/SDL_sysgpu.h` are copies from the pinned SDL. Diff them against the new release's `src/gpu/`, take its changes, and keep this repository's: in `SDL_gpu.c`, the `XDL_wgpu.h` include, the backend table `{ &WebGPUDriver, NULL }` and the mapping of `SDL_GPU_SHADERFORMAT_WGSL` to `SDL_PROP_GPU_DEVICE_CREATE_SHADERS_WGSL_BOOLEAN`; in `SDL_sysgpu.h`, the `WebGPUDriver` declaration. `diff external/SDL/src/gpu/SDL_gpu.c src/SDL_gpu.c` shows them.
 2. If the new SDL adds `SDL_GPU*` functions, the smoke test's link fails with `duplicate symbol` errors that name them. Add them to the backend.
 3. SDL 3.4.x is the supported range. A new minor version (3.6) is a larger change: the vtable in `SDL_sysgpu.h` and the backend's functions may change.
 4. Update the SDL version in README: SDL version, Releases, the Layout table and Changes to the backend.

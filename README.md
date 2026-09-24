@@ -24,7 +24,7 @@ If a future SDL release adds `SDL_GPU*` functions, the link fails with `duplicat
 
 The library is built against SDL `release-3.4.16` (git submodule `external/SDL`) and links against any 3.4.x `libSDL3.a`: the public GPU function set and the internal helpers the backend uses (`SDL_CreateHashTable` family, `SDL_GetVideoDevice`, `SDL_DebugLogBackend`) are unchanged from 3.4.0 to 3.4.16. SDL 3.2.x is not supported.
 
-`src/SDL_gpu.c` and `src/SDL_sysgpu.h` are copies from the pinned SDL with one change (the backend table) and are owned by this repository.
+`src/SDL_gpu.c` and `src/SDL_sysgpu.h` are copies from the pinned SDL and are owned by this repository. `SDL_gpu.c` has three changes: it includes `XDL_wgpu.h`, its backend table is `{ &WebGPUDriver, NULL }`, and it maps `SDL_GPU_SHADERFORMAT_WGSL` to `SDL_PROP_GPU_DEVICE_CREATE_SHADERS_WGSL_BOOLEAN`. `SDL_sysgpu.h` has one: it declares `WebGPUDriver`.
 
 ## Shader format: WGSL
 

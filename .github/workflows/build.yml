@@ -29,11 +29,12 @@ jobs:
           git submodule update --init --depth 1 external/SDL external/SDL_image external/SDL_mixer external/SDL_ttf
           git -C external/SDL_ttf submodule update --init --depth 1 external/freetype external/harfbuzz external/plutosvg external/plutovg
 
-      # A pull request builds under the tag its commit would be released as.
+      # A pull request builds GitHub's test merge commit, which is never released, so its assets carry the placeholder tag pr-<number>.
       - name: Name the build
         env:
           INPUT_TAG: ${{ inputs.tag }}
-        run: echo "TAG=${INPUT_TAG:-$(TZ=UTC git log -1 --date=format-local:%Y%m%d.%H%M%S --format=v%cd)}" >> "$GITHUB_ENV"
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: echo "TAG=${INPUT_TAG:-pr-$PR_NUMBER}" >> "$GITHUB_ENV"
 
       # The archives link into the .NET browser runtime only when they are built by the Emscripten of its wasm-tools workload.
       - uses: actions/setup-dotnet@v6
@@ -67,8 +68,8 @@ jobs:
       # A cache of its own: a .NET link into the cache tools/emsdk-env.sh uses emptied it locally, emdawnwebgpu port included.
       - name: Link the release assets into the .NET browser runtime
         run: |
-          dotnet publish test/dotnet -c Release -p:XdlArchiveDirectory="$PWD/build/release-assets" -p:WasmCachePath="$PWD/build/dotnet-em-cache"
-          node test/dotnet/run.mjs test/dotnet/bin/Release/net11.0/publish/wwwroot
+          dotnet publish test/dotnet -c Release -o build/dotnet-link -p:XdlArchiveDirectory="$PWD/build/release-assets" -p:WasmCachePath="$PWD/build/dotnet-em-cache"
+          node test/dotnet/run.mjs build/dotnet-link/wwwroot
 
       - uses: actions/upload-artifact@v7
         with:

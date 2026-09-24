@@ -1,8 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk.WebAssembly">
     <!--
       Links the release archives into the .NET browser runtime and binds every library through its P/Invoke module.
-      dotnet publish test/dotnet -c Release -p:XdlArchiveDirectory=<release assets> -p:WasmCachePath=<writable Emscripten cache, not the one of tools/emsdk-env.sh>
-      node test/dotnet/run.mjs <publish wwwroot>
+      dotnet publish test/dotnet -c Release -o build/dotnet-link -p:XdlArchiveDirectory=<release assets> -p:WasmCachePath=<writable Emscripten cache, not the one of tools/emsdk-env.sh>
+      node test/dotnet/run.mjs build/dotnet-link/wwwroot
     -->
     <PropertyGroup>
         <TargetFramework>net11.0</TargetFramework>
