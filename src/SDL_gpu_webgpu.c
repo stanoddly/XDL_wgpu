@@ -457,6 +457,8 @@ static bool WebGPUTextureFormatIsBlendable(WGPUTextureFormat format, bool blenda
 {
     // TODO: I couldn't find a list of which formats support blending so we'll just add them when we find them
     switch (format) {
+    case WGPUTextureFormat_R32Float:
+    case WGPUTextureFormat_RG32Float:
     case WGPUTextureFormat_RGBA32Float:
         return blendableFloat32FeatureEnabled;
     default:
@@ -3714,11 +3716,11 @@ static SDL_GPUGraphicsPipeline *WEBGPU_CreateGraphicsPipeline(SDL_GPURenderer *d
 
     WGPUColorTargetState *colorTargets = SDL_calloc(createInfo->target_info.num_color_targets, sizeof(WGPUColorTargetState));
     WGPUBlendState *colorTargetBlendStates = SDL_calloc(createInfo->target_info.num_color_targets, sizeof(WGPUBlendState));
+    bool float32Blendable = wgpuDeviceHasFeature(((WebGPURenderer *)driverData)->device, WGPUFeatureName_Float32Blendable);
     for (int i = 0; i < createInfo->target_info.num_color_targets; i++) {
         const SDL_GPUColorTargetDescription *targetDesc = &createInfo->target_info.color_target_descriptions[i];
 
-        bool float32Filterable = wgpuDeviceHasFeature(((WebGPURenderer *)driverData)->device, WGPUFeatureName_Float32Filterable);
-        if (WebGPUTextureFormatIsBlendable(SDLToWebGPU_TextureFormat[targetDesc->format], float32Filterable)) {
+        if (targetDesc->blend_state.enable_blend && WebGPUTextureFormatIsBlendable(SDLToWebGPU_TextureFormat[targetDesc->format], float32Blendable)) {
             colorTargetBlendStates[i].color = (WGPUBlendComponent){
                 .dstFactor = SDLToWebGPU_BlendFactor[targetDesc->blend_state.dst_color_blendfactor],
                 .srcFactor = SDLToWebGPU_BlendFactor[targetDesc->blend_state.src_color_blendfactor],
