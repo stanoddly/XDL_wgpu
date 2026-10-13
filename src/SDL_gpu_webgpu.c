@@ -486,7 +486,7 @@ static bool WebGPUTextureFormatIsBlendable(WGPUTextureFormat format, bool blenda
 }
 
 // WebGPU requires both factors to be one for min and max, which ignore them.
-static WGPUBlendComponent WebGPUBlendComponent(SDL_GPUBlendFactor srcFactor, SDL_GPUBlendFactor dstFactor, SDL_GPUBlendOp op)
+static WGPUBlendComponent SDLToWebGPU_BlendComponent(SDL_GPUBlendFactor srcFactor, SDL_GPUBlendFactor dstFactor, SDL_GPUBlendOp op)
 {
     bool ignoresFactors = op == SDL_GPU_BLENDOP_MIN || op == SDL_GPU_BLENDOP_MAX;
     return (WGPUBlendComponent){
@@ -3752,8 +3752,8 @@ static SDL_GPUGraphicsPipeline *WEBGPU_CreateGraphicsPipeline(SDL_GPURenderer *d
 
         if (targetDesc->blend_state.enable_blend && WebGPUTextureFormatIsBlendable(SDLToWebGPU_TextureFormat[targetDesc->format], float32Blendable)) {
             const SDL_GPUColorTargetBlendState *blend = &targetDesc->blend_state;
-            colorTargetBlendStates[i].color = WebGPUBlendComponent(blend->src_color_blendfactor, blend->dst_color_blendfactor, blend->color_blend_op);
-            colorTargetBlendStates[i].alpha = WebGPUBlendComponent(blend->src_alpha_blendfactor, blend->dst_alpha_blendfactor, blend->alpha_blend_op);
+            colorTargetBlendStates[i].color = SDLToWebGPU_BlendComponent(blend->src_color_blendfactor, blend->dst_color_blendfactor, blend->color_blend_op);
+            colorTargetBlendStates[i].alpha = SDLToWebGPU_BlendComponent(blend->src_alpha_blendfactor, blend->dst_alpha_blendfactor, blend->alpha_blend_op);
             colorTargets[i].blend = &colorTargetBlendStates[i];
         } else {
             colorTargets[i].blend = NULL;
