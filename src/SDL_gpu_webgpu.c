@@ -79,13 +79,11 @@ static WGPUPresentMode SDLToWebGPU_PresentMode[] = {
 // I've been able to use a lot of them just fine (on Linux nonetheless), so I'm not sure what's up with that.
 
 // These are features which we don't *need*, but they'd be really nice to have.
-const WGPUFeatureName WEBGPU_INTERNAL_OptionalFeatures[11] = {
+const WGPUFeatureName WEBGPU_INTERNAL_OptionalFeatures[10] = {
     // These two have 99.98% coverage on WebGPU devices. Without them, D32_FLOAT_S8_UINT is unsupported
     // and R11G11B10_UFLOAT cannot be a color target.
     WGPUFeatureName_Depth32FloatStencil8,
     WGPUFeatureName_RG11B10UfloatRenderable,
-    // This one has 95%, blame Samsung. Without it, B8G8R8A8 textures cannot have storage usage.
-    WGPUFeatureName_BGRA8UnormStorage,
     // This one has 90%. Without it, 32-bit float textures can only be sampled without filtering.
     WGPUFeatureName_Float32Filterable,
     // This one has 85%.
@@ -6250,10 +6248,8 @@ static bool WEBGPU_SupportsTextureFormat(SDL_GPURenderer *driverData, SDL_GPUTex
         return !hasDepthUsage && !hasReadWriteStorageUsage;
     case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM:
     case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB:
-        if (hasStorageUsage && !wgpuDeviceHasFeature(renderer->device, WGPUFeatureName_BGRA8UnormStorage)) {
-            return false;
-        }
-        return !hasDepthUsage && !hasReadWriteStorageUsage;
+        // bgra8unorm-storage only allows write-only storage of B8G8R8A8_UNORM, and SDL rejects compute writes to it.
+        return !hasDepthUsage && !hasStorageUsage;
     case SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM:
     case SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM:
     case SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM:
