@@ -74,25 +74,18 @@ static WGPUPresentMode SDLToWebGPU_PresentMode[] = {
     WGPUPresentMode_Mailbox,
 };
 
-// NOTE: All of these required features are subject to change as we test it on different browsers and operating systems.
+// NOTE: All of these features are subject to change as we test it on different browsers and operating systems.
 // Also, note that while Firefox's documentation *claims* that a lot of features are unsupported,
 // I've been able to use a lot of them just fine (on Linux nonetheless), so I'm not sure what's up with that.
 
-const WGPUFeatureName WEBGPU_INTERNAL_RequiredFeatures[6] = {
-    // These three all have 99.98% coverage on WebGPU devices.
+// These are features which we don't *need*, but they'd be really nice to have.
+const WGPUFeatureName WEBGPU_INTERNAL_OptionalFeatures[10] = {
+    // These two have 99.98% coverage on WebGPU devices. Without them, D32_FLOAT_S8_UINT is unsupported
+    // and R11G11B10_UFLOAT cannot be a color target.
     WGPUFeatureName_Depth32FloatStencil8,
     WGPUFeatureName_RG11B10UfloatRenderable,
-    WGPUFeatureName_IndirectFirstInstance,
-    // This one has 98%, and only because of Samsung's weird browser.
-    WGPUFeatureName_DepthClipControl,
-    // This one has 95%, blame Samsung.
-    WGPUFeatureName_BGRA8UnormStorage,
-    // This one has 90%.
+    // This one has 90%. Without it, 32-bit float textures can only be sampled without filtering.
     WGPUFeatureName_Float32Filterable,
-};
-
-// These are features which we don't *need*, but they'd be really nice to have.
-const WGPUFeatureName WEBGPU_INTERNAL_OptionalFeatures[7] = {
     // This one has 85%.
     WGPUFeatureName_Float32Blendable,
 
@@ -793,6 +786,20 @@ typedef struct WebGPUFence WebGPUFence;
 typedef struct WebGPUSubmittedCommandBuffer WebGPUSubmittedCommandBuffer;
 typedef struct WebGPUQueuedDestroy WebGPUQueuedDestroy;
 
+// The blit fragment shaders and the pipelines built from them, for one kind of source texture binding.
+typedef struct WebGPUBlitFragmentShaders
+{
+    SDL_GPUShader *from2D;
+    SDL_GPUShader *from2DArray;
+    SDL_GPUShader *from3D;
+    SDL_GPUShader *fromCube;
+    SDL_GPUShader *fromCubeArray;
+
+    BlitPipelineCacheEntry *pipelines;
+    Uint32 pipelineCount;
+    Uint32 pipelineCapacity;
+} WebGPUBlitFragmentShaders;
+
 typedef struct WebGPURenderer
 {
     WGPUInstance instance;
@@ -816,16 +823,12 @@ typedef struct WebGPURenderer
     Uint32 queuedDestroyCount;
     Uint32 queuedDestroyCapacity;
 
-    BlitPipelineCacheEntry *blitPipelines;
-
     struct blitResources
     {
         SDL_GPUShader *blitVertexShader;
-        SDL_GPUShader *blit2DShader;
-        SDL_GPUShader *blit2DArrayShader;
-        SDL_GPUShader *blit3DShader;
-        SDL_GPUShader *blitCubeShader;
-        SDL_GPUShader *blitCubeArrayShader;
+        WebGPUBlitFragmentShaders filterable;
+        // Only created when the device lacks float32-filterable, for blits from 32-bit float textures.
+        WebGPUBlitFragmentShaders unfilterable;
 
         SDL_GPUSampler *blitNearestSampler;
         SDL_GPUSampler *blitLinearSampler;
@@ -853,8 +856,6 @@ typedef struct WebGPURenderer
     Uint64 numSubmissions;
 
     Uint32 maxFramesInFlight;
-    Uint32 blitPipelineCount;
-    Uint32 blitPipelineCapacity;
 
     Uint32 nextBindableResourceID;
 
@@ -1087,6 +1088,7 @@ struct WebGPUBufferContainer
 typedef struct WebGPUTextureView
 {
     WGPUTextureView view;
+    WGPUTextureFormat format;
 
     Uint64 identifier;
     char **dependants;
@@ -1244,6 +1246,7 @@ typedef struct WebGPUShaderBindGroupLayouts
     WGPUBindGroupLayout samplerStorageBindGroupLayout;
     WGPUBindGroupLayout uniformBindGroupLayout;
     Uint32 numSamplerStorageEntries; // Hack fix to prevent binding resources to groups with 0 binds
+    Uint32 filterableTextureSlots;   // Bit i is set when the texture in sampler slot i has the filterable float sample type.
 } WebGPUShaderBindGroupLayouts;
 
 typedef struct WebGPUComputeShaderBindGroupLayouts
@@ -1251,6 +1254,7 @@ typedef struct WebGPUComputeShaderBindGroupLayouts
     WGPUBindGroupLayout samplerStorageBindGroupLayout;
     WGPUBindGroupLayout readWriteStorageBindGroupLayout;
     WGPUBindGroupLayout uniformBindGroupLayout;
+    Uint32 filterableTextureSlots; // Bit i is set when the texture in sampler slot i has the filterable float sample type.
 } WebGPUComputeShaderBindGroupLayouts;
 
 // TODO: Maybe this should be called something like "WebGPUGraphicsShader" to specify that it's only for graphics and not compute?
@@ -1671,65 +1675,84 @@ static void WEBGPU_INTERNAL_RequestAdapter(WebGPURenderer *renderer, bool *succe
     WEBGPU_INTERNAL_ForgetFuture((double)future.id);
 }
 
-static bool WEBGPU_INTERNAL_DeviceHasRequiredFeatures(WGPUDevice device)
+// WebGPU can only filter these formats with the float32-filterable feature.
+static bool WEBGPU_INTERNAL_IsFloat32Format(WGPUTextureFormat format)
 {
-    bool result = true;
+    return format == WGPUTextureFormat_R32Float || format == WGPUTextureFormat_RG32Float || format == WGPUTextureFormat_RGBA32Float;
+}
 
-    for (int i = 0; i < SDL_arraysize(WEBGPU_INTERNAL_RequiredFeatures); i++) {
-        if (!wgpuDeviceHasFeature(device, WEBGPU_INTERNAL_RequiredFeatures[i])) {
-            SDL_LogError(SDL_LOG_CATEGORY_GPU, "WebGPU device does not have required feature \"%s\"!", WEBGPU_FeatureNameToString(WEBGPU_INTERNAL_RequiredFeatures[i]));
-            result = false;
+// Fills requiredFeatures with the WebGPU features behind the SDL_PROP_GPU_DEVICE_CREATE_FEATURE_* properties that are enabled.
+static Uint32 WEBGPU_INTERNAL_GetRequiredFeatures(SDL_PropertiesID props, WGPUFeatureName requiredFeatures[3])
+{
+    Uint32 count = 0;
+
+    // This one has 98%, and only because of Samsung's weird browser.
+    if (SDL_GetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_DEPTH_CLAMPING_BOOLEAN, true)) {
+        requiredFeatures[count++] = WGPUFeatureName_DepthClipControl;
+    }
+    // This one has 99.98%.
+    if (SDL_GetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_INDIRECT_DRAW_FIRST_INSTANCE_BOOLEAN, true)) {
+        requiredFeatures[count++] = WGPUFeatureName_IndirectFirstInstance;
+    }
+    if (SDL_GetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_CLIP_DISTANCE_BOOLEAN, false)) {
+        requiredFeatures[count++] = WGPUFeatureName_ClipDistances;
+    }
+
+    return count;
+}
+
+// Sets the error to "<subject> lacks features: <names>" when any required feature is missing.
+static bool WEBGPU_INTERNAL_HasRequiredFeatures(const WGPUSupportedFeatures *supportedFeatures, const WGPUFeatureName *requiredFeatures, Uint32 requiredFeatureCount, const char *subject)
+{
+    char missing[512] = "";
+
+    for (int i = 0; i < requiredFeatureCount; i++) {
+        bool supported = false;
+        for (int j = 0; j < supportedFeatures->featureCount; j++) {
+            if (requiredFeatures[i] == supportedFeatures->features[j]) {
+                supported = true;
+                break;
+            }
+        }
+        if (!supported) {
+            if (missing[0] != '\0') {
+                SDL_strlcat(missing, ", ", sizeof(missing));
+            }
+            // Without the "WGPUFeatureName_" prefix, all names fit in the 127 characters that single-threaded SDL builds keep of an error.
+            SDL_strlcat(missing, WEBGPU_FeatureNameToString(requiredFeatures[i]) + SDL_strlen("WGPUFeatureName_"), sizeof(missing));
         }
     }
 
-    return result;
+    if (missing[0] != '\0') {
+        SDL_SetError("%s lacks features: %s", subject, missing);
+        return false;
+    }
+
+    return true;
 }
 
 static void WEBGPU_INTERNAL_RequestDevice(WebGPURenderer *renderer, bool *success)
 {
     WGPUDeviceDescriptor deviceDesc = WGPU_DEVICE_DESCRIPTOR_INIT;
 
-    bool clipDistance = SDL_GetBooleanProperty(renderer->props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_CLIP_DISTANCE_BOOLEAN, false);
+    WGPUFeatureName requiredFeatures[3];
+    Uint32 requiredFeatureCount = WEBGPU_INTERNAL_GetRequiredFeatures(renderer->props, requiredFeatures);
     Uint32 numFeaturesEnabled = 0;
-    Uint32 featureCapacity = SDL_arraysize(WEBGPU_INTERNAL_RequiredFeatures) + SDL_arraysize(WEBGPU_INTERNAL_OptionalFeatures) + 1;
+    Uint32 featureCapacity = requiredFeatureCount + SDL_arraysize(WEBGPU_INTERNAL_OptionalFeatures);
 
     WGPUFeatureName *features = SDL_calloc(featureCapacity, sizeof(WGPUFeatureName));
     WGPUSupportedFeatures supportedFeatures = { 0 };
 
     wgpuAdapterGetFeatures(renderer->adapter, &supportedFeatures);
 
-    if (clipDistance) {
-        WEBGPU_INTERNAL_InsertElementIntoArray(features, featureCapacity, numFeaturesEnabled, WGPUFeatureName, WGPUFeatureName_ClipDistances);
+    if (!WEBGPU_INTERNAL_HasRequiredFeatures(&supportedFeatures, requiredFeatures, requiredFeatureCount, "WebGPU adapter")) {
+        wgpuSupportedFeaturesFreeMembers(supportedFeatures);
+        SDL_free(features);
+        return;
     }
 
-    // This code is horrible.
-    for (int i = 0; i < SDL_arraysize(WEBGPU_INTERNAL_RequiredFeatures); i++) {
-        bool supported = false;
-        for (int j = 0; j < supportedFeatures.featureCount; j++) {
-            if (WEBGPU_INTERNAL_RequiredFeatures[i] == supportedFeatures.features[j]) {
-                WEBGPU_INTERNAL_InsertElementIntoArray(features, featureCapacity, numFeaturesEnabled, WGPUFeatureName, WEBGPU_INTERNAL_RequiredFeatures[i]);
-                supported = true;
-                break;
-            }
-        }
-        if (!supported) {
-            SDL_LogError(SDL_LOG_CATEGORY_GPU, "WebGPU adapter does not support required feature \"%s\"!", WEBGPU_FeatureNameToString(WEBGPU_INTERNAL_RequiredFeatures[i]));
-            SDL_assert_release(!"WebGPU adapter does not support all required features!");
-        }
-    }
-
-    for (int i = 0; i < SDL_arraysize(WEBGPU_INTERNAL_RequiredFeatures); i++) {
-        bool supported = false;
-        for (int j = 0; j < supportedFeatures.featureCount; j++) {
-            if (WEBGPU_INTERNAL_RequiredFeatures[i] == supportedFeatures.features[j]) {
-                WEBGPU_INTERNAL_InsertElementIntoArray(features, featureCapacity, numFeaturesEnabled, WGPUFeatureName, WEBGPU_INTERNAL_RequiredFeatures[i]);
-                supported = true;
-                break;
-            }
-        }
-        if (!supported) {
-            SDL_LogError(SDL_LOG_CATEGORY_GPU, "WebGPU adapter does not support required feature \"%s\"!", WEBGPU_FeatureNameToString(WEBGPU_INTERNAL_RequiredFeatures[i]));
-        }
+    for (int i = 0; i < requiredFeatureCount; i++) {
+        WEBGPU_INTERNAL_InsertElementIntoArray(features, featureCapacity, numFeaturesEnabled, WGPUFeatureName, requiredFeatures[i]);
     }
 
     for (int i = 0; i < SDL_arraysize(WEBGPU_INTERNAL_OptionalFeatures); i++) {
@@ -1786,6 +1809,10 @@ static void WEBGPU_INTERNAL_RequestDevice(WebGPURenderer *renderer, bool *succes
         SDL_DelayNS(100);
     }
     WEBGPU_INTERNAL_ForgetFuture((double)future.id);
+
+    if (renderer->device == NULL) {
+        SDL_SetError("Could not get WebGPU device!");
+    }
 
     wgpuSupportedFeaturesFreeMembers(supportedFeatures);
     SDL_free(features);
@@ -2481,6 +2508,10 @@ static WebGPUShaderBindGroupLayouts *WEBGPU_INTERNAL_GenerateBindGroupLayoutsFor
             entry.texture.multisampled = parsedEntry->texture.isMultisampled;
             entry.texture.sampleType = parsedEntry->texture.sampleType;
             entry.texture.nextInChain = NULL;
+            // Sampler slot i binds its texture at binding 2i and its sampler at binding 2i + 1.
+            if (entry.texture.sampleType == WGPUTextureSampleType_Float && parsedEntry->binding / 2 < MAX_TEXTURE_SAMPLERS_PER_STAGE) {
+                result->filterableTextureSlots |= 1u << (parsedEntry->binding / 2);
+            }
             break;
         case WEBGPU_BIND_GROUP_ENTRY_TYPE_STORAGE_BUFFER:
             entry.buffer.type = parsedEntry->storageBuffer.canWrite ? WGPUBufferBindingType_Storage : WGPUBufferBindingType_ReadOnlyStorage;
@@ -2584,6 +2615,10 @@ static WebGPUComputeShaderBindGroupLayouts *WEBGPU_INTERNAL_GenerateBindGroupLay
             entry.texture.viewDimension = parsedEntry->texture.dimension;
             entry.texture.multisampled = parsedEntry->texture.isMultisampled;
             entry.texture.nextInChain = NULL;
+            // Sampler slot i binds its texture at binding 2i and its sampler at binding 2i + 1.
+            if (parsedEntry->group == 0 && entry.texture.sampleType == WGPUTextureSampleType_Float && parsedEntry->binding / 2 < MAX_TEXTURE_SAMPLERS_PER_STAGE) {
+                result->filterableTextureSlots |= 1u << (parsedEntry->binding / 2);
+            }
             break;
         case WEBGPU_BIND_GROUP_ENTRY_TYPE_STORAGE_BUFFER:
             entry.buffer.type = parsedEntry->storageBuffer.canWrite ? WGPUBufferBindingType_Storage : WGPUBufferBindingType_ReadOnlyStorage;
@@ -2984,6 +3019,17 @@ static WebGPUBindGroupCacheKey WEBGPU_INTERNAL_GenerateKeyForCurrentBinds(WebGPU
     return result;
 }
 
+// Without float32-filterable, WebGPU rejects a 32-bit float texture bound where the shader expects a filterable one.
+// The bind group still gets created so WebGPU reports its own validation error, but this error names the binding and the fix.
+static void WEBGPU_INTERNAL_CheckSampledTextureFilterable(WebGPURenderer *renderer, WebGPUTextureView *view, Uint32 filterableTextureSlots, Uint32 group, Uint32 slot)
+{
+    if ((filterableTextureSlots & (1u << slot)) && WEBGPU_INTERNAL_IsFloat32Format(view->format) && !wgpuDeviceHasFeature(renderer->device, WGPUFeatureName_Float32Filterable)) {
+        // Single-threaded SDL builds keep only 127 characters of an error.
+        SDL_SetError("@group(%u) @binding(%u) cannot filter 32-bit floats; use SDLGPU_ForceAllowSamplingForTexture(%u, %u) and a nearest sampler", group, slot * 2, group, slot * 2);
+        SDL_LogError(SDL_LOG_CATEGORY_GPU, "%s", SDL_GetError());
+    }
+}
+
 static WebGPUBindGroup *WEBGPU_INTERNAL_CreateBindGroup(WebGPUCommandBuffer *cmdBuf, WebGPUBindGroupType type, WebGPUBindGroupCacheKey key)
 {
     WebGPUBindGroup *result = NULL;
@@ -3011,6 +3057,7 @@ static WebGPUBindGroup *WEBGPU_INTERNAL_CreateBindGroup(WebGPUCommandBuffer *cmd
                 continue;
             }
 
+            WEBGPU_INTERNAL_CheckSampledTextureFilterable(cmdBuf->renderer, textureBind, cmdBuf->boundGraphicsPipeline->vertexBindGroupLayouts.filterableTextureSlots, 0, offset / 2);
             entries[offset].textureView = textureBind->view;
             entries[offset].binding = offset;
             offset++;
@@ -3068,6 +3115,7 @@ static WebGPUBindGroup *WEBGPU_INTERNAL_CreateBindGroup(WebGPUCommandBuffer *cmd
                 continue;
             }
 
+            WEBGPU_INTERNAL_CheckSampledTextureFilterable(cmdBuf->renderer, textureBind, cmdBuf->boundGraphicsPipeline->fragmentBindGroupLayouts.filterableTextureSlots, 2, offset / 2);
             entries[offset].textureView = textureBind->view;
             entries[offset].binding = offset;
             offset++;
@@ -3125,6 +3173,7 @@ static WebGPUBindGroup *WEBGPU_INTERNAL_CreateBindGroup(WebGPUCommandBuffer *cmd
                 continue;
             }
 
+            WEBGPU_INTERNAL_CheckSampledTextureFilterable(cmdBuf->renderer, textureBind, cmdBuf->boundComputePipeline->bindGroupLayouts->filterableTextureSlots, 0, offset / 2);
             entries[offset].textureView = textureBind->view;
             entries[offset].binding = offset;
             offset++;
@@ -3297,6 +3346,7 @@ static WebGPUTextureView *WEBGPU_INTERNAL_CreateTextureView(WebGPURenderer *rend
 
     result->identifier = renderer->nextBindableResourceID++;
     result->view = wgpuTextureCreateView(texture->texture, &desc);
+    result->format = format;
 
     return result;
 }
@@ -3915,16 +3965,69 @@ static void WEBGPU_ReleaseFence(SDL_GPURenderer *device, SDL_GPUFence *fence)
     WEBGPU_INTERNAL_QueueFenceForRelease((WebGPURenderer *)device, (WebGPUFence *)fence);
 }
 
+static SDL_GPUShader *WEBGPU_INTERNAL_CreateBlitFragmentShader(WebGPURenderer *renderer, const char *source, bool unfilterable)
+{
+    SDL_GPUShaderCreateInfo shaderCreateInfo;
+    char *code = NULL;
+
+    // The directive makes the source texture binding unfilterable and its sampler binding non-filtering.
+    SDL_asprintf(&code, "%s%s", unfilterable ? "// SDLGPU_ForceAllowSamplingForTexture(2, 0)\n" : "", source);
+
+    SDL_zero(shaderCreateInfo);
+    shaderCreateInfo.code = (Uint8 *)code;
+    shaderCreateInfo.code_size = SDL_strlen(code);
+    shaderCreateInfo.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
+    shaderCreateInfo.format = SDL_GPU_SHADERFORMAT_WGSL;
+    shaderCreateInfo.entrypoint = "main";
+    shaderCreateInfo.num_samplers = 1;
+    shaderCreateInfo.num_uniform_buffers = 1;
+
+    SDL_GPUShader *shader = WEBGPU_CreateShader((SDL_GPURenderer *)renderer, &shaderCreateInfo);
+    SDL_free(code);
+
+    if (shader == NULL) {
+        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to compile blit fragment shader!");
+    }
+
+    return shader;
+}
+
+static void WEBGPU_INTERNAL_InitBlitFragmentShaders(WebGPURenderer *renderer, WebGPUBlitFragmentShaders *shaders, bool unfilterable)
+{
+    shaders->from2D = WEBGPU_INTERNAL_CreateBlitFragmentShader(renderer, blit2DShader, unfilterable);
+    shaders->from2DArray = WEBGPU_INTERNAL_CreateBlitFragmentShader(renderer, blit2DArrayShader, unfilterable);
+    shaders->from3D = WEBGPU_INTERNAL_CreateBlitFragmentShader(renderer, blit3DShader, unfilterable);
+    shaders->fromCube = WEBGPU_INTERNAL_CreateBlitFragmentShader(renderer, blitCubeShader, unfilterable);
+    shaders->fromCubeArray = WEBGPU_INTERNAL_CreateBlitFragmentShader(renderer, blitCubeArrayShader, unfilterable);
+
+    shaders->pipelineCapacity = 2;
+    shaders->pipelineCount = 0;
+    shaders->pipelines = (BlitPipelineCacheEntry *)SDL_calloc(shaders->pipelineCapacity, sizeof(BlitPipelineCacheEntry));
+}
+
+static void WEBGPU_INTERNAL_ReleaseBlitFragmentShaders(WebGPURenderer *renderer, WebGPUBlitFragmentShaders *shaders)
+{
+    if (shaders->pipelines == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < shaders->pipelineCount; i++) {
+        WEBGPU_ReleaseGraphicsPipeline((SDL_GPURenderer *)renderer, shaders->pipelines[i].pipeline);
+    }
+    SDL_free(shaders->pipelines);
+
+    WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)shaders->from2D);
+    WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)shaders->from2DArray);
+    WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)shaders->from3D);
+    WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)shaders->fromCube);
+    WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)shaders->fromCubeArray);
+}
+
 // Should out to klukaszek for writing the blit code because wow I hate blitting
 static void WEBGPU_INTERNAL_InitBlitResources(
     WebGPURenderer *renderer)
 {
     SDL_GPUShaderCreateInfo shaderCreateInfo;
-
-    renderer->blitPipelineCapacity = 2;
-    renderer->blitPipelineCount = 0;
-    renderer->blitPipelines = (BlitPipelineCacheEntry *)SDL_calloc(
-        renderer->blitPipelineCapacity, sizeof(BlitPipelineCacheEntry));
 
     // Fullscreen vertex shader
     SDL_zero(shaderCreateInfo);
@@ -3941,53 +4044,9 @@ static void WEBGPU_INTERNAL_InitBlitResources(
         SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to compile vertex shader for blit!");
     }
 
-    shaderCreateInfo.code = (Uint8 *)blit2DShader;
-    shaderCreateInfo.code_size = SDL_strlen(blit2DShader);
-    shaderCreateInfo.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
-    shaderCreateInfo.num_samplers = 1;
-    shaderCreateInfo.num_uniform_buffers = 1;
-    renderer->blitResources.blit2DShader = WEBGPU_CreateShader(
-        (SDL_GPURenderer *)renderer,
-        &shaderCreateInfo);
-    if (renderer->blitResources.blit2DShader == NULL) {
-        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to compile Blit2D pixel shader!");
-    }
-
-    shaderCreateInfo.code = (Uint8 *)blit2DArrayShader;
-    shaderCreateInfo.code_size = SDL_strlen(blit2DArrayShader);
-    shaderCreateInfo.entrypoint = "main";
-    renderer->blitResources.blit2DArrayShader = WEBGPU_CreateShader(
-        (SDL_GPURenderer *)renderer,
-        &shaderCreateInfo);
-    if (renderer->blitResources.blit2DArrayShader == NULL) {
-        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to compile Blit2DArray pixel shader!");
-    }
-
-    shaderCreateInfo.code = (Uint8 *)blit3DShader;
-    shaderCreateInfo.code_size = SDL_strlen(blit3DShader);
-    renderer->blitResources.blit3DShader = WEBGPU_CreateShader(
-        (SDL_GPURenderer *)renderer,
-        &shaderCreateInfo);
-    if (renderer->blitResources.blit3DShader == NULL) {
-        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to compile Blit3D pixel shader!");
-    }
-
-    shaderCreateInfo.code = (Uint8 *)blitCubeShader;
-    shaderCreateInfo.code_size = SDL_strlen(blitCubeShader);
-    renderer->blitResources.blitCubeShader = WEBGPU_CreateShader(
-        (SDL_GPURenderer *)renderer,
-        &shaderCreateInfo);
-    if (renderer->blitResources.blitCubeShader == NULL) {
-        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to compile BlitCube pixel shader!");
-    }
-
-    shaderCreateInfo.code = (Uint8 *)blitCubeArrayShader;
-    shaderCreateInfo.code_size = SDL_strlen(blitCubeArrayShader);
-    renderer->blitResources.blitCubeArrayShader = WEBGPU_CreateShader(
-        (SDL_GPURenderer *)renderer,
-        &shaderCreateInfo);
-    if (renderer->blitResources.blitCubeArrayShader == NULL) {
-        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to compile BlitCubeArray pixel shader!");
+    WEBGPU_INTERNAL_InitBlitFragmentShaders(renderer, &renderer->blitResources.filterable, false);
+    if (!wgpuDeviceHasFeature(renderer->device, WGPUFeatureName_Float32Filterable)) {
+        WEBGPU_INTERNAL_InitBlitFragmentShaders(renderer, &renderer->blitResources.unfilterable, true);
     }
 
     SDL_GPUSamplerCreateInfo nearestCreateInfo = (SDL_GPUSamplerCreateInfo){
@@ -4027,18 +4086,11 @@ static void WEBGPU_INTERNAL_InitBlitResources(
 
 static void WEBGPU_INTERNAL_ReleaseBlitResources(WebGPURenderer *renderer)
 {
-    WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)renderer->blitResources.blit2DArrayShader);
-    WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)renderer->blitResources.blit2DShader);
-    WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)renderer->blitResources.blit3DShader);
-    WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)renderer->blitResources.blitCubeShader);
-    WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)renderer->blitResources.blitCubeArrayShader);
+    WEBGPU_INTERNAL_ReleaseBlitFragmentShaders(renderer, &renderer->blitResources.filterable);
+    WEBGPU_INTERNAL_ReleaseBlitFragmentShaders(renderer, &renderer->blitResources.unfilterable);
     WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)renderer->blitResources.blitVertexShader);
     WEBGPU_INTERNAL_ReleaseSampler(renderer, (WebGPUSampler *)renderer->blitResources.blitLinearSampler);
     WEBGPU_INTERNAL_ReleaseSampler(renderer, (WebGPUSampler *)renderer->blitResources.blitNearestSampler);
-
-    for (int i = 0; i < renderer->blitPipelineCount; i++) {
-        WEBGPU_ReleaseGraphicsPipeline((SDL_GPURenderer *)renderer, renderer->blitPipelines[i].pipeline);
-    }
 }
 
 static WebGPUBuffer *WEBGPU_INTERNAL_CreateBuffer(WebGPURenderer *renderer, Uint64 size, SDL_GPUBufferUsageFlags usageFlags, WebGPUBufferType bufferType, const char *debugName)
@@ -5755,7 +5807,6 @@ static void WEBGPU_DestroyDevice(SDL_GPUDevice *device)
     SDL_DestroyProperties(renderer->props);
     SDL_UnlockMutex(renderer->destroyingSelfLock);
     SDL_DestroyMutex(renderer->destroyingSelfLock);
-    SDL_free(renderer->blitPipelines);
     SDL_free(renderer->submittedCommandBuffers);
     SDL_free(renderer->claimedWindows);
     SDL_free(renderer);
@@ -5845,21 +5896,26 @@ static void WEBGPU_DownloadFromTexture(SDL_GPUCommandBuffer *commandBuffer, cons
 static void WEBGPU_Blit(SDL_GPUCommandBuffer *commandBuffer, const SDL_GPUBlitInfo *info)
 {
     WebGPURenderer *renderer = ((WebGPUCommandBuffer *)commandBuffer)->renderer;
+    SDL_GPUTextureFormat sourceFormat = ((TextureCommonHeader *)info->source.texture)->info.format;
+
+    // Without float32-filterable, a 32-bit float source can only be sampled through an unfilterable binding with a nearest sampler.
+    bool unfilterable = renderer->blitResources.unfilterable.pipelines != NULL && WEBGPU_INTERNAL_IsFloat32Format(SDLToWebGPU_TextureFormat[sourceFormat]);
+    WebGPUBlitFragmentShaders *shaders = unfilterable ? &renderer->blitResources.unfilterable : &renderer->blitResources.filterable;
 
     SDL_GPU_BlitCommon(
         commandBuffer,
         info,
-        renderer->blitResources.blitLinearSampler,
+        unfilterable ? renderer->blitResources.blitNearestSampler : renderer->blitResources.blitLinearSampler,
         renderer->blitResources.blitNearestSampler,
         renderer->blitResources.blitVertexShader,
-        renderer->blitResources.blit2DShader,
-        renderer->blitResources.blit2DArrayShader,
-        renderer->blitResources.blit3DShader,
-        renderer->blitResources.blitCubeShader,
-        renderer->blitResources.blitCubeArrayShader,
-        &renderer->blitPipelines,
-        &renderer->blitPipelineCount,
-        &renderer->blitPipelineCapacity);
+        shaders->from2D,
+        shaders->from2DArray,
+        shaders->from3D,
+        shaders->fromCube,
+        shaders->fromCubeArray,
+        &shaders->pipelines,
+        &shaders->pipelineCount,
+        &shaders->pipelineCapacity);
 }
 
 static SDL_GPUTextureFormat WEBGPU_GetSwapchainTextureFormat(SDL_GPURenderer *device, SDL_Window *window)
@@ -6120,7 +6176,7 @@ static bool WEBGPU_SupportsTextureFormat(SDL_GPURenderer *driverData, SDL_GPUTex
 
     bool hasStorageUsage = usage & (SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ |
                                     SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE);
-    bool hasReadWriteStorageUsage = (usage & SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE & SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ) || usage & SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE;
+    bool hasReadWriteStorageUsage = usage & SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE;
     bool hasDepthUsage = usage & SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
     bool hasColorTargetUsage = usage & SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
     bool hasRenderUsage = usage & SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
@@ -6192,13 +6248,8 @@ static bool WEBGPU_SupportsTextureFormat(SDL_GPURenderer *driverData, SDL_GPUTex
         return !hasDepthUsage && !hasReadWriteStorageUsage;
     case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM:
     case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB:
-        if (hasStorageUsage && !hasReadWriteStorageUsage && wgpuDeviceHasFeature(renderer->device, WGPUFeatureName_BGRA8UnormStorage)) {
-            return true;
-        } else if (!hasDepthUsage && !hasReadWriteStorageUsage) {
-            return true;
-        } else {
-            return false;
-        }
+        // bgra8unorm-storage only allows write-only storage of B8G8R8A8_UNORM, and SDL rejects compute writes to it.
+        return !hasDepthUsage && !hasStorageUsage;
     case SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM:
     case SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM:
     case SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM:
@@ -6232,11 +6283,10 @@ static bool WEBGPU_SupportsTextureFormat(SDL_GPURenderer *driverData, SDL_GPUTex
 
         return !hasDepthUsage && !hasReadWriteStorageUsage;
     case SDL_GPU_TEXTUREFORMAT_R11G11B10_UFLOAT:
-        if (hasColorTargetUsage) {
-            return wgpuDeviceHasFeature(renderer->device, WGPUFeatureName_RG11B10UfloatRenderable) && !hasDepthUsage && !hasReadWriteStorageUsage;
-        } else {
+        if (hasColorTargetUsage && !wgpuDeviceHasFeature(renderer->device, WGPUFeatureName_RG11B10UfloatRenderable)) {
             return false;
         }
+        return !hasDepthUsage && !hasStorageUsage;
     case SDL_GPU_TEXTUREFORMAT_D16_UNORM:
     case SDL_GPU_TEXTUREFORMAT_D24_UNORM:
     case SDL_GPU_TEXTUREFORMAT_D32_FLOAT:
@@ -6392,8 +6442,13 @@ static SDL_GPUDevice *WEBGPU_CreateDevice(bool debugMode, bool preferLowPower, S
     }
 
     if (externalDevice != NULL) {
-        if (!WEBGPU_INTERNAL_DeviceHasRequiredFeatures(externalDevice)) {
-            SDL_SetError("Adopted WebGPU device lacks required features, see the log");
+        WGPUFeatureName requiredFeatures[3];
+        Uint32 requiredFeatureCount = WEBGPU_INTERNAL_GetRequiredFeatures(renderer->props, requiredFeatures);
+        WGPUSupportedFeatures deviceFeatures = { 0 };
+        wgpuDeviceGetFeatures(externalDevice, &deviceFeatures);
+        bool hasRequiredFeatures = WEBGPU_INTERNAL_HasRequiredFeatures(&deviceFeatures, requiredFeatures, requiredFeatureCount, "Adopted WebGPU device");
+        wgpuSupportedFeaturesFreeMembers(deviceFeatures);
+        if (!hasRequiredFeatures) {
             WEBGPU_INTERNAL_DestroyPartialRenderer(renderer);
             return NULL;
         }
@@ -6403,8 +6458,8 @@ static SDL_GPUDevice *WEBGPU_CreateDevice(bool debugMode, bool preferLowPower, S
         WEBGPU_INTERNAL_RequestDevice(renderer, &getDeviceSucceeded);
     }
 
+    // WEBGPU_INTERNAL_RequestDevice has set the error.
     if (!renderer->device) {
-        SDL_SetError("Could not get WebGPU device!");
         WEBGPU_INTERNAL_DestroyPartialRenderer(renderer);
         return NULL;
     }
