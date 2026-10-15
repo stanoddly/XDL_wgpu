@@ -6178,7 +6178,7 @@ static bool WEBGPU_SupportsTextureFormat(SDL_GPURenderer *driverData, SDL_GPUTex
 
     bool hasStorageUsage = usage & (SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ |
                                     SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE);
-    bool hasReadWriteStorageUsage = (usage & SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE & SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ) || usage & SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE;
+    bool hasReadWriteStorageUsage = usage & SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE;
     bool hasDepthUsage = usage & SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
     bool hasColorTargetUsage = usage & SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
     bool hasRenderUsage = usage & SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
@@ -6250,13 +6250,10 @@ static bool WEBGPU_SupportsTextureFormat(SDL_GPURenderer *driverData, SDL_GPUTex
         return !hasDepthUsage && !hasReadWriteStorageUsage;
     case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM:
     case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB:
-        if (hasStorageUsage && !hasReadWriteStorageUsage && wgpuDeviceHasFeature(renderer->device, WGPUFeatureName_BGRA8UnormStorage)) {
-            return true;
-        } else if (!hasDepthUsage && !hasReadWriteStorageUsage) {
-            return true;
-        } else {
+        if (hasStorageUsage && !wgpuDeviceHasFeature(renderer->device, WGPUFeatureName_BGRA8UnormStorage)) {
             return false;
         }
+        return !hasDepthUsage && !hasReadWriteStorageUsage;
     case SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM:
     case SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM:
     case SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM:
@@ -6293,7 +6290,7 @@ static bool WEBGPU_SupportsTextureFormat(SDL_GPURenderer *driverData, SDL_GPUTex
         if (hasColorTargetUsage && !wgpuDeviceHasFeature(renderer->device, WGPUFeatureName_RG11B10UfloatRenderable)) {
             return false;
         }
-        return !hasDepthUsage && !hasReadWriteStorageUsage;
+        return !hasDepthUsage && !hasStorageUsage;
     case SDL_GPU_TEXTUREFORMAT_D16_UNORM:
     case SDL_GPU_TEXTUREFORMAT_D24_UNORM:
     case SDL_GPU_TEXTUREFORMAT_D32_FLOAT:
