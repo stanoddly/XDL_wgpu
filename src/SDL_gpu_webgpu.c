@@ -5000,7 +5000,7 @@ static void WEBGPU_PushComputeUniformData(SDL_GPUCommandBuffer *commandBuffer, U
 
 static void WEBGPU_SetBlendConstants(SDL_GPUCommandBuffer *commandBuffer, SDL_FColor blendConstants)
 {
-    wgpuRenderPassEncoderSetBlendConstant(((WebGPUCommandBuffer *)commandBuffer)->renderPassEncoder, &(WGPUColor){ blendConstants.a, blendConstants.r, blendConstants.g, blendConstants.b });
+    wgpuRenderPassEncoderSetBlendConstant(((WebGPUCommandBuffer *)commandBuffer)->renderPassEncoder, &(WGPUColor){ blendConstants.r, blendConstants.g, blendConstants.b, blendConstants.a });
 }
 
 // Native backends accept rects that hang over the render area; WebGPU does not, so clamp to keep them equivalent.
