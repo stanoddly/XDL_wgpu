@@ -41,7 +41,7 @@ typedef struct AppState
     int frames_submitted;
     int futures_after_init;
     int presented_frame_allocations;
-    SDL_GPUTexture *swapchain_copy_source;
+    SDL_GPUTexture *frame_source;
 } AppState;
 
 static SDL_malloc_func original_malloc;
@@ -424,7 +424,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
         return SDL_APP_FAILURE;
     }
 
-    SDL_GPUTextureCreateInfo copy_source_info = {
+    // Source of the copies and the blit in every presented frame.
+    SDL_GPUTextureCreateInfo frame_source_info = {
         .type = SDL_GPU_TEXTURETYPE_2D,
         .format = SDL_GetGPUSwapchainTextureFormat(state->device, state->window),
         .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
@@ -433,9 +434,9 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
         .layer_count_or_depth = 1,
         .num_levels = 1,
     };
-    state->swapchain_copy_source = SDL_CreateGPUTexture(state->device, &copy_source_info);
-    if (!state->swapchain_copy_source) {
-        SDL_Log("SDL_CreateGPUTexture for the swapchain copy source failed: %s", SDL_GetError());
+    state->frame_source = SDL_CreateGPUTexture(state->device, &frame_source_info);
+    if (!state->frame_source) {
+        SDL_Log("SDL_CreateGPUTexture for the frame source failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
 
@@ -467,13 +468,22 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         SDL_EndGPURenderPass(SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL));
 
         // A swapchain texture cannot be cycled. The second copy finds it in use by the first, so if it were cycled,
-        // the copy would create a texture, which the allocation count catches.
+        // the frame would go to a new offscreen texture and WebGPU would report a destroyed texture used in a submit.
         SDL_GPUCopyPass *copy_pass = SDL_BeginGPUCopyPass(cmd);
-        SDL_GPUTextureLocation source = { .texture = state->swapchain_copy_source };
+        SDL_GPUTextureLocation source = { .texture = state->frame_source };
         SDL_GPUTextureLocation destination = { .texture = swapchain_texture };
         SDL_CopyGPUTextureToTexture(copy_pass, &source, &destination, 1, 1, 1, true);
         SDL_CopyGPUTextureToTexture(copy_pass, &source, &destination, 1, 1, 1, true);
         SDL_EndGPUCopyPass(copy_pass);
+
+        // A blit binds a pipeline, a texture and a sampler, so it covers the bind group cache.
+        SDL_GPUBlitInfo blit = {
+            .source = { .texture = state->frame_source, .w = 1, .h = 1 },
+            .destination = { .texture = swapchain_texture, .w = 16, .h = 16 },
+            .load_op = SDL_GPU_LOADOP_LOAD,
+            .filter = SDL_GPU_FILTER_NEAREST,
+        };
+        SDL_BlitGPUTexture(cmd, &blit);
     }
     bool submitted = SDL_SubmitGPUCommandBuffer(cmd);
     counting_allocations = false;
@@ -507,7 +517,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     if (state) {
         if (state->device) {
             SDL_WaitForGPUIdle(state->device);
-            SDL_ReleaseGPUTexture(state->device, state->swapchain_copy_source);
+            SDL_ReleaseGPUTexture(state->device, state->frame_source);
             if (state->window) {
                 SDL_ReleaseWindowFromGPUDevice(state->device, state->window);
             }

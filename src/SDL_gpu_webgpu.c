@@ -3281,7 +3281,9 @@ static WGPUBindGroup WEBGPU_INTERNAL_GetBindGroup(WebGPUCommandBuffer *cmdBuf, W
         result = WEBGPU_INTERNAL_CreateBindGroup(cmdBuf, type, key);
     }
 
-    result->lastUsedAtSubmission = cmdBuf->renderer->numSubmissions + 1;
+    // The number this command buffer's submission will get. One more would make the unsigned age in the cache trim wrap,
+    // and the bind group would expire at this very submit.
+    result->lastUsedAtSubmission = cmdBuf->renderer->numSubmissions;
 
     return result->bindGroup;
 }
