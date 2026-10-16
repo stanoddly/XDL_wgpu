@@ -3760,11 +3760,13 @@ static SDL_GPUGraphicsPipeline *WEBGPU_CreateGraphicsPipeline(SDL_GPURenderer *d
     WebGPUShader *vertexShader = (WebGPUShader *)createInfo->vertex_shader;
     WebGPUShader *fragmentShader = (WebGPUShader *)createInfo->fragment_shader;
 
+    // WebGPU rejects a non-zero depth bias on point and line topologies, which the native backends accept.
+    bool isTriangleTopology = createInfo->primitive_type == SDL_GPU_PRIMITIVETYPE_TRIANGLELIST || createInfo->primitive_type == SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP;
+    bool depthBiasEnabled = createInfo->rasterizer_state.enable_depth_bias && isTriangleTopology;
     WGPUDepthStencilState depthStencilState = {
-        // yucky wucky
-        .depthBias = (Uint32)createInfo->rasterizer_state.depth_bias_constant_factor,
-        .depthBiasClamp = createInfo->rasterizer_state.depth_bias_clamp,
-        .depthBiasSlopeScale = createInfo->rasterizer_state.depth_bias_slope_factor,
+        .depthBias = depthBiasEnabled ? (Sint32)SDL_lroundf(createInfo->rasterizer_state.depth_bias_constant_factor) : 0,
+        .depthBiasClamp = depthBiasEnabled ? createInfo->rasterizer_state.depth_bias_clamp : 0.0f,
+        .depthBiasSlopeScale = depthBiasEnabled ? createInfo->rasterizer_state.depth_bias_slope_factor : 0.0f,
         .depthCompare = SDLToWebGPU_CompareFunc[createInfo->depth_stencil_state.compare_op],
         .depthWriteEnabled = createInfo->depth_stencil_state.enable_depth_write,
         .stencilBack = createInfo->depth_stencil_state.enable_stencil_test ? (WGPUStencilFaceState){
