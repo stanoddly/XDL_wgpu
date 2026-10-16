@@ -29,7 +29,10 @@
 #define TEST_HEIGHT 4
 #define NARROW_WIDTH 5
 #define NARROW_HEIGHT 3
-#define FRAMES_TO_SUBMIT 3
+// Enough warm-up frames to fill the backend's pools with its default of 2 frames in flight.
+#define WARM_UP_FRAMES 4
+#define COUNTED_FRAMES 3
+#define FRAMES_TO_SUBMIT (WARM_UP_FRAMES + COUNTED_FRAMES)
 
 typedef struct AppState
 {
@@ -37,7 +40,33 @@ typedef struct AppState
     SDL_GPUDevice *device;
     int frames_submitted;
     int futures_after_init;
+    int presented_frame_allocations;
+    SDL_GPUTexture *swapchain_copy_source;
 } AppState;
+
+static SDL_malloc_func original_malloc;
+static SDL_calloc_func original_calloc;
+static SDL_realloc_func original_realloc;
+static bool counting_allocations;
+static int allocation_count;
+
+static void *SDLCALL CountingMalloc(size_t size)
+{
+    allocation_count += counting_allocations;
+    return original_malloc(size);
+}
+
+static void *SDLCALL CountingCalloc(size_t nmemb, size_t size)
+{
+    allocation_count += counting_allocations;
+    return original_calloc(nmemb, size);
+}
+
+static void *SDLCALL CountingRealloc(void *mem, size_t size)
+{
+    allocation_count += counting_allocations;
+    return original_realloc(mem, size);
+}
 
 // Promises emdawnwebgpu keeps for futures under Asyncify; each one the backend does not drop stays for the life of the page.
 static int CountTrackedFutures(void)
@@ -185,6 +214,79 @@ static bool UploadAndDownload3D(SDL_GPUDevice *device, Uint32 width, Uint32 heig
     return true;
 }
 
+// Records a frame like an app's render loop: uniform pushes, a render pass with color and depth targets, a submit with a fence.
+static bool SubmitOffscreenFrame(SDL_GPUDevice *device, SDL_GPUTexture *color, SDL_GPUTexture *depth)
+{
+    static const float uniforms[16] = { 0 };
+
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(device);
+    if (!cmd) {
+        return SDL_SetError("SDL_AcquireGPUCommandBuffer: %s", SDL_GetError());
+    }
+    for (int i = 0; i < 3; i++) {
+        SDL_PushGPUVertexUniformData(cmd, 0, uniforms, sizeof(uniforms));
+        SDL_PushGPUFragmentUniformData(cmd, 0, uniforms, sizeof(uniforms));
+        SDL_PushGPUComputeUniformData(cmd, 0, uniforms, sizeof(uniforms));
+    }
+
+    SDL_GPUColorTargetInfo color_target = { .texture = color, .load_op = SDL_GPU_LOADOP_CLEAR, .store_op = SDL_GPU_STOREOP_STORE };
+    SDL_GPUDepthStencilTargetInfo depth_target = {
+        .texture = depth,
+        .clear_depth = 1.0f,
+        .load_op = SDL_GPU_LOADOP_CLEAR,
+        .store_op = SDL_GPU_STOREOP_DONT_CARE,
+        .stencil_load_op = SDL_GPU_LOADOP_DONT_CARE,
+        .stencil_store_op = SDL_GPU_STOREOP_DONT_CARE,
+    };
+    SDL_EndGPURenderPass(SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target));
+
+    SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    if (!fence) {
+        return SDL_SetError("SDL_SubmitGPUCommandBufferAndAcquireFence: %s", SDL_GetError());
+    }
+    SDL_WaitForGPUFences(device, true, &fence, 1);
+    SDL_ReleaseGPUFence(device, fence);
+    return true;
+}
+
+// Counts the SDL allocator calls of COUNTED_FRAMES frames that follow WARM_UP_FRAMES frames.
+static bool CountFrameAllocations(SDL_GPUDevice *device, int *out_count)
+{
+    SDL_GPUTextureCreateInfo color_info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+        .width = TEST_WIDTH,
+        .height = TEST_HEIGHT,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    };
+    SDL_GPUTextureCreateInfo depth_info = color_info;
+    depth_info.format = SDL_GPU_TEXTUREFORMAT_D16_UNORM;
+    depth_info.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+    SDL_GPUTexture *color = SDL_CreateGPUTexture(device, &color_info);
+    SDL_GPUTexture *depth = SDL_CreateGPUTexture(device, &depth_info);
+    if (!color || !depth) {
+        return SDL_SetError("SDL_CreateGPUTexture: %s", SDL_GetError());
+    }
+
+    bool success = true;
+    for (int i = 0; i < WARM_UP_FRAMES && success; i++) {
+        success = SubmitOffscreenFrame(device, color, depth);
+    }
+    allocation_count = 0;
+    counting_allocations = true;
+    for (int i = 0; i < COUNTED_FRAMES && success; i++) {
+        success = SubmitOffscreenFrame(device, color, depth);
+    }
+    counting_allocations = false;
+    *out_count = allocation_count;
+
+    SDL_ReleaseGPUTexture(device, color);
+    SDL_ReleaseGPUTexture(device, depth);
+    return success;
+}
+
 static bool PixelsAreUniform(const Uint8 *pixels, Uint32 count, Uint32 bytes_per_pixel)
 {
     for (Uint32 i = 1; i < count; i++) {
@@ -197,6 +299,10 @@ static bool PixelsAreUniform(const Uint8 *pixels, Uint32 count, Uint32 bytes_per
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
 {
+    SDL_free_func original_free;
+    SDL_GetMemoryFunctions(&original_malloc, &original_calloc, &original_realloc, &original_free);
+    SDL_SetMemoryFunctions(CountingMalloc, CountingCalloc, CountingRealloc, original_free);
+
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
@@ -307,6 +413,32 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
         return SDL_APP_FAILURE;
     }
 
+    // The backend reuses command buffers, fences and uniform staging memory, so a frame after warm-up allocates nothing.
+    int frame_allocations = 0;
+    if (!CountFrameAllocations(state->device, &frame_allocations)) {
+        SDL_Log("Frame allocation test failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    SDL_Log("SDL allocations in %d frames after %d warm-up frames: %d", COUNTED_FRAMES, WARM_UP_FRAMES, frame_allocations);
+    if (frame_allocations != 0) {
+        return SDL_APP_FAILURE;
+    }
+
+    SDL_GPUTextureCreateInfo copy_source_info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GetGPUSwapchainTextureFormat(state->device, state->window),
+        .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = 1,
+        .height = 1,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    };
+    state->swapchain_copy_source = SDL_CreateGPUTexture(state->device, &copy_source_info);
+    if (!state->swapchain_copy_source) {
+        SDL_Log("SDL_CreateGPUTexture for the swapchain copy source failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
     SDL_WaitForGPUIdle(state->device);
     state->futures_after_init = CountTrackedFutures();
 
@@ -317,6 +449,8 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 {
     AppState *state = appstate;
 
+    allocation_count = 0;
+    counting_allocations = state->frames_submitted >= WARM_UP_FRAMES;
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(state->device);
     SDL_GPUTexture *swapchain_texture = NULL;
     if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, state->window, &swapchain_texture, NULL, NULL)) {
@@ -331,8 +465,20 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             .store_op = SDL_GPU_STOREOP_STORE,
         };
         SDL_EndGPURenderPass(SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL));
+
+        // A swapchain texture cannot be cycled. The second copy finds it in use by the first, so if it were cycled,
+        // the copy would create a texture, which the allocation count catches.
+        SDL_GPUCopyPass *copy_pass = SDL_BeginGPUCopyPass(cmd);
+        SDL_GPUTextureLocation source = { .texture = state->swapchain_copy_source };
+        SDL_GPUTextureLocation destination = { .texture = swapchain_texture };
+        SDL_CopyGPUTextureToTexture(copy_pass, &source, &destination, 1, 1, 1, true);
+        SDL_CopyGPUTextureToTexture(copy_pass, &source, &destination, 1, 1, 1, true);
+        SDL_EndGPUCopyPass(copy_pass);
     }
-    if (!SDL_SubmitGPUCommandBuffer(cmd)) {
+    bool submitted = SDL_SubmitGPUCommandBuffer(cmd);
+    counting_allocations = false;
+    state->presented_frame_allocations += allocation_count;
+    if (!submitted) {
         SDL_Log("SDL_SubmitGPUCommandBuffer failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
@@ -346,7 +492,8 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     SDL_WaitForGPUIdle(state->device);
     int futures_after_frames = CountTrackedFutures();
     SDL_Log("Tracked futures: %d after init, %d after %d frames", state->futures_after_init, futures_after_frames, FRAMES_TO_SUBMIT);
-    return futures_after_frames <= state->futures_after_init ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    SDL_Log("SDL allocations in %d presented frames after %d warm-up frames: %d", COUNTED_FRAMES, WARM_UP_FRAMES, state->presented_frame_allocations);
+    return futures_after_frames <= state->futures_after_init && state->presented_frame_allocations == 0 ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
 }
 
 SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
@@ -360,6 +507,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     if (state) {
         if (state->device) {
             SDL_WaitForGPUIdle(state->device);
+            SDL_ReleaseGPUTexture(state->device, state->swapchain_copy_source);
             if (state->window) {
                 SDL_ReleaseWindowFromGPUDevice(state->device, state->window);
             }

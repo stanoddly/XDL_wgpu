@@ -768,14 +768,18 @@ fn main(@location(0) tex: vec2<f32>) -> @location(0) vec4<f32> {\n\
 }";
 
 // I hate manual memory management so much I'm just reinventing the dynamic array but worse
-#define WEBGPU_INTERNAL_InsertElementIntoArray(array, arrayCapacity, arrayElementCount, elementType, element)    \
-    do {                                                                                                         \
-        EXPAND_ARRAY_IF_NEEDED(array, elementType, arrayElementCount + 1, arrayCapacity, arrayElementCount + 1); \
-        ((elementType *)array)[arrayElementCount++] = element;                                                   \
+// The capacity doubles, so an array that is emptied and refilled to the same count does not reallocate.
+#define WEBGPU_INTERNAL_InsertElementIntoArray(array, arrayCapacity, arrayElementCount, elementType, element)        \
+    do {                                                                                                             \
+        EXPAND_ARRAY_IF_NEEDED(array, elementType, arrayElementCount, arrayCapacity, SDL_max(arrayCapacity * 2, 4)); \
+        ((elementType *)array)[arrayElementCount++] = element;                                                       \
     } while (0)
 
 // WebGPU is bad and stinky
 #define ALIGN_VALUE(value, alignment) (value % alignment != 0 ? value + (alignment - (value % alignment)) : value)
+
+// XDL_wgpu is built without pthreads (SDL_THREADS_DISABLED), so every call runs on the thread that created the device.
+// The locks and the main-thread checks come from SDL_wgpu and are not enough for multithreaded use. See #6 before relying on them.
 
 typedef struct WebGPUTexture WebGPUTexture;
 typedef struct WebGPUTextureContainer WebGPUTextureContainer;
@@ -784,6 +788,7 @@ typedef struct WebGPUBufferContainer WebGPUBufferContainer;
 typedef struct WebGPUWindowData WebGPUWindowData;
 typedef struct WebGPUFence WebGPUFence;
 typedef struct WebGPUSubmittedCommandBuffer WebGPUSubmittedCommandBuffer;
+typedef struct WebGPUCommandBuffer WebGPUCommandBuffer;
 typedef struct WebGPUQueuedDestroy WebGPUQueuedDestroy;
 
 // The blit fragment shaders and the pipelines built from them, for one kind of source texture binding.
@@ -815,9 +820,24 @@ typedef struct WebGPURenderer
     // 0: Vertex, 1: Fragment, 2: Compute
     WGPUBindGroup uniformBufferBindGroups[3];
 
-    WebGPUSubmittedCommandBuffer **submittedCommandBuffers;
+    WebGPUCommandBuffer **submittedCommandBuffers;
     Uint32 submittedCommandBufferCapacity;
     Uint32 submittedCommandBufferCount;
+
+    // Command buffers whose submissions completed, kept with their arrays for the next acquire.
+    WebGPUCommandBuffer **availableCommandBuffers;
+    Uint32 availableCommandBufferCount;
+    Uint32 availableCommandBufferCapacity;
+
+    // Signaled fences that nothing references any more.
+    WebGPUFence **availableFences;
+    Uint32 availableFenceCount;
+    Uint32 availableFenceCapacity;
+
+    // Swapchain texture wrappers released at submit. Only the WebGPU texture and views inside change per frame.
+    WebGPUTextureContainer **availableSwapchainTextures;
+    Uint32 availableSwapchainTextureCount;
+    Uint32 availableSwapchainTextureCapacity;
 
     WebGPUQueuedDestroy **queuedDestroys;
     Uint32 queuedDestroyCount;
@@ -841,6 +861,9 @@ typedef struct WebGPURenderer
     SDL_Mutex *destroyingSelfLock;
     SDL_Mutex *registeringQueuedDestroyLock;
     SDL_Mutex *submittingCommandBufferLock;
+    SDL_Mutex *acquiringCommandBufferLock;
+    SDL_Mutex *acquiringFenceLock;
+    SDL_Mutex *acquiringSwapchainTextureLock;
     SDL_Mutex *creatingWebGPUResourceLock;
     SDL_Mutex *claimingWindowLock;
 
@@ -931,8 +954,6 @@ typedef enum WebGPUQueuedDestroyType
     WEBGPU_QUEUED_DESTROY_SAMPLER,
     WEBGPU_QUEUED_DESTROY_BUFFER_CONTAINER,
     WEBGPU_QUEUED_DESTROY_BUFFER,
-    WEBGPU_QUEUED_DESTROY_FENCE,
-    WEBGPU_QUEUED_DESTROY_SUBMITTED_COMMAND_BUFFER,
     WEBGPU_QUEUED_DESTROY_BIND_GROUP,
 } WebGPUQueuedDestroyType;
 
@@ -1147,6 +1168,8 @@ typedef struct WebGPUFence
 {
     WGPUFutureWaitInfo future;
     SDL_AtomicInt status;
+    // The submission holds one reference until the fence signals, and the app one more if it acquired the fence.
+    SDL_AtomicInt referenceCount;
 } WebGPUFence;
 
 typedef struct WebGPUQueuedResourceBindSampler
@@ -1210,7 +1233,8 @@ typedef struct WebGPUQueuedResourceBindIndexBuffer
 
 typedef struct WebGPUQueuedUniformDataUpload
 {
-    void *data;
+    // Where the data starts in the command buffer's uniform staging area.
+    Uint32 stagingOffset;
 
     Uint64 offset;
     Uint32 length;
@@ -1230,8 +1254,6 @@ typedef struct WebGPUQueuedDestroy
         WebGPUBufferContainer *bufferContainer;
         WebGPUBuffer *buffer;
 
-        WebGPUFence *fence;
-        WebGPUSubmittedCommandBuffer *submittedCommandBuffer;
         WebGPUBindGroup *bindGroup;
     } resource;
 
@@ -1308,7 +1330,7 @@ struct WebGPUSubmittedCommandBuffer
     Uint32 usedTextureCapacity;
 };
 
-typedef struct WebGPUCommandBuffer
+struct WebGPUCommandBuffer
 {
     CommandBufferCommonHeader common;
 
@@ -1339,7 +1361,10 @@ typedef struct WebGPUCommandBuffer
     Uint32 numQueuedUniformUploads;
     Uint32 queuedUniformUploadCapacity;
 
-    size_t totalUniformDataLen;
+    // The pushed uniform data of the queued uploads, each push padded to 256 bytes.
+    Uint8 *uniformStaging;
+    Uint32 uniformStagingSize;
+    Uint32 uniformStagingCapacity;
 
     bool hasBoundGraphicsPipeline;
     bool hasBoundComputePipeline;
@@ -1407,7 +1432,7 @@ typedef struct WebGPUCommandBuffer
     // WebGPU rejects viewports and scissors that reach outside it, so they are clamped to it.
     Uint32 renderAreaW;
     Uint32 renderAreaH;
-} WebGPUCommandBuffer;
+};
 
 static void
 WEBGPU_INTERNAL_FenceCallback(WGPUQueueWorkDoneStatus status, WGPUStringView message, void *fence, void *unused)
@@ -1597,34 +1622,6 @@ static void WEBGPU_INTERNAL_QueueBufferForRelease(WebGPURenderer *renderer, WebG
     destroy = SDL_calloc(1, sizeof(*destroy));
     destroy->type = WEBGPU_QUEUED_DESTROY_BUFFER;
     destroy->resource.buffer = buffer;
-
-    WEBGPU_INTERNAL_RegisterQueuedDestroy(renderer, destroy);
-}
-
-static void WEBGPU_INTERNAL_QueueFenceForRelease(WebGPURenderer *renderer, WebGPUFence *fence)
-{
-    WebGPUQueuedDestroy *destroy = NULL;
-    if (fence == NULL) {
-        return;
-    }
-
-    destroy = SDL_calloc(1, sizeof(*destroy));
-    destroy->type = WEBGPU_QUEUED_DESTROY_FENCE;
-    destroy->resource.fence = fence;
-
-    WEBGPU_INTERNAL_RegisterQueuedDestroy(renderer, destroy);
-}
-
-static void WEBGPU_INTERNAL_QueueSubmittedCommandBufferForRelease(WebGPURenderer *renderer, WebGPUSubmittedCommandBuffer *commandBuffer)
-{
-    WebGPUQueuedDestroy *destroy = NULL;
-    if (commandBuffer == NULL) {
-        return;
-    }
-
-    destroy = SDL_calloc(1, sizeof(*destroy));
-    destroy->type = WEBGPU_QUEUED_DESTROY_SUBMITTED_COMMAND_BUFFER;
-    destroy->resource.submittedCommandBuffer = commandBuffer;
 
     WEBGPU_INTERNAL_RegisterQueuedDestroy(renderer, destroy);
 }
@@ -1839,36 +1836,30 @@ static SDL_GPUCommandBuffer *WEBGPU_AcquireCommandBuffer(SDL_GPURenderer *device
     // It does have a "command buffer", but that's something you get after saying "Hey, I'm not gonna do anything more with this.",
     // which is the exact opposite of what a command buffer is in SDL_GPU.
     // So, I had to do this gross hack. God, please forgive me.
-    WebGPUCommandBuffer *wrapper;
+    WebGPURenderer *renderer = (WebGPURenderer *)device;
+    WebGPUCommandBuffer *wrapper = NULL;
 
-    if (SDL_GetAtomicInt(&((WebGPURenderer *)device)->deviceLost)) {
+    if (SDL_GetAtomicInt(&renderer->deviceLost)) {
         SDL_SetError("WebGPU device has been lost");
         return NULL;
     }
 
-    wrapper = (WebGPUCommandBuffer *)SDL_calloc(1, sizeof(*wrapper));
+    SDL_LockMutex(renderer->acquiringCommandBufferLock);
+    if (renderer->availableCommandBufferCount > 0) {
+        wrapper = renderer->availableCommandBuffers[--renderer->availableCommandBufferCount];
+    }
+    SDL_UnlockMutex(renderer->acquiringCommandBufferLock);
 
-    wrapper->renderer = (WebGPURenderer *)device;
+    if (wrapper == NULL) {
+        wrapper = (WebGPUCommandBuffer *)SDL_calloc(1, sizeof(*wrapper));
+    }
 
-    wrapper->encoder = wgpuDeviceCreateCommandEncoder(((WebGPURenderer *)device)->device, NULL);
-    wrapper->queue = ((WebGPURenderer *)device)->queue;
-    wrapper->device = ((WebGPURenderer *)device)->device;
-    wrapper->instance = ((WebGPURenderer *)device)->instance;
+    wrapper->renderer = renderer;
 
-    WGPUSurface *surfaces;
-    WebGPUTextureContainer **acquiredSwapchainTextures;
-    surfaces = SDL_calloc(2, sizeof(WGPUSurface));
-    acquiredSwapchainTextures = SDL_calloc(2, sizeof(*acquiredSwapchainTextures));
-
-    // Allocating enough space for two since XR and stuff
-    // It'll automatically resize if needed but that's slow so eeeh
-    wrapper->surfaces = surfaces;
-    wrapper->surfaceCount = 0;
-    wrapper->surfaceCapacity = 2;
-
-    wrapper->acquiredSwapchainTextures = acquiredSwapchainTextures;
-    wrapper->swapchainTextureCount = 0;
-    wrapper->swapchainTextureCapacity = 2;
+    wrapper->encoder = wgpuDeviceCreateCommandEncoder(renderer->device, NULL);
+    wrapper->queue = renderer->queue;
+    wrapper->device = renderer->device;
+    wrapper->instance = renderer->instance;
 
     return (SDL_GPUCommandBuffer *)wrapper;
 }
@@ -1961,28 +1952,82 @@ static void WEBGPU_INTERNAL_PublishQueuedRepacks(WebGPUCommandBuffer *cmdBuf)
 
 static void WEBGPU_INTERNAL_FreeCommandBuffer(WebGPUCommandBuffer *cmdBuf)
 {
+    SDL_free(cmdBuf->submitted.usedBuffers);
+    SDL_free(cmdBuf->submitted.usedTextures);
     SDL_free(cmdBuf->queuedRepacks);
     SDL_free(cmdBuf->surfaces);
     SDL_free(cmdBuf->acquiredSwapchainTextures);
     SDL_free(cmdBuf->queuedUniformUploads);
+    SDL_free(cmdBuf->uniformStaging);
     SDL_free(cmdBuf);
 }
 
-// Create a new fence which will be called by wgpuQueueOnSubmittedWorkDone
-static WebGPUFence *WEBGPU_INTERNAL_CreateFence(WGPUQueue queue)
+// Resets the command buffer as if newly allocated, but keeps its arrays, emptied, for the next acquire.
+static void WEBGPU_INTERNAL_ReturnCommandBufferToPool(WebGPURenderer *renderer, WebGPUCommandBuffer *cmdBuf)
 {
-    WebGPUFence *fence = SDL_calloc(1, sizeof(*fence));
-    SDL_SetAtomicInt(&fence->status, 0);
+    WebGPUCommandBuffer recycled = *cmdBuf;
 
-    fence->future.future = wgpuQueueOnSubmittedWorkDone(queue, (WGPUQueueWorkDoneCallbackInfo){
-                                                                   .callback = WEBGPU_INTERNAL_FenceCallback,
-                                                                   .mode = WGPUCallbackMode_WaitAnyOnly,
-                                                                   .nextInChain = NULL,
-                                                                   .userdata1 = fence,
-                                                                   .userdata2 = NULL,
-                                                               });
+    SDL_zerop(cmdBuf);
+    cmdBuf->submitted.usedBuffers = recycled.submitted.usedBuffers;
+    cmdBuf->submitted.usedBufferCapacity = recycled.submitted.usedBufferCapacity;
+    cmdBuf->submitted.usedTextures = recycled.submitted.usedTextures;
+    cmdBuf->submitted.usedTextureCapacity = recycled.submitted.usedTextureCapacity;
+    cmdBuf->queuedRepacks = recycled.queuedRepacks;
+    cmdBuf->queuedRepackCapacity = recycled.queuedRepackCapacity;
+    cmdBuf->queuedUniformUploads = recycled.queuedUniformUploads;
+    cmdBuf->queuedUniformUploadCapacity = recycled.queuedUniformUploadCapacity;
+    cmdBuf->uniformStaging = recycled.uniformStaging;
+    cmdBuf->uniformStagingCapacity = recycled.uniformStagingCapacity;
+    cmdBuf->surfaces = recycled.surfaces;
+    cmdBuf->surfaceCapacity = recycled.surfaceCapacity;
+    cmdBuf->acquiredSwapchainTextures = recycled.acquiredSwapchainTextures;
+    cmdBuf->swapchainTextureCapacity = recycled.swapchainTextureCapacity;
+
+    SDL_LockMutex(renderer->acquiringCommandBufferLock);
+    WEBGPU_INTERNAL_InsertElementIntoArray(renderer->availableCommandBuffers, renderer->availableCommandBufferCapacity,
+                                           renderer->availableCommandBufferCount, WebGPUCommandBuffer *, cmdBuf);
+    SDL_UnlockMutex(renderer->acquiringCommandBufferLock);
+}
+
+// Returns a fence, with one reference, that signals once the work submitted so far is done.
+static WebGPUFence *WEBGPU_INTERNAL_AcquireFence(WebGPURenderer *renderer)
+{
+    WebGPUFence *fence = NULL;
+
+    SDL_LockMutex(renderer->acquiringFenceLock);
+    if (renderer->availableFenceCount > 0) {
+        fence = renderer->availableFences[--renderer->availableFenceCount];
+    }
+    SDL_UnlockMutex(renderer->acquiringFenceLock);
+
+    if (fence == NULL) {
+        fence = SDL_calloc(1, sizeof(*fence));
+    }
+
+    SDL_SetAtomicInt(&fence->status, 0);
+    SDL_SetAtomicInt(&fence->referenceCount, 1);
+    fence->future.completed = false;
+    fence->future.future = wgpuQueueOnSubmittedWorkDone(renderer->queue, (WGPUQueueWorkDoneCallbackInfo){
+                                                                             .callback = WEBGPU_INTERNAL_FenceCallback,
+                                                                             .mode = WGPUCallbackMode_WaitAnyOnly,
+                                                                             .nextInChain = NULL,
+                                                                             .userdata1 = fence,
+                                                                             .userdata2 = NULL,
+                                                                         });
 
     return fence;
+}
+
+// The submission keeps its reference until the fence signals, so the last release always finds it signaled,
+// and no callback can write into it after it is reused.
+static void WEBGPU_INTERNAL_ReleaseFence(WebGPURenderer *renderer, WebGPUFence *fence)
+{
+    if (SDL_AtomicDecRef(&fence->referenceCount)) {
+        SDL_LockMutex(renderer->acquiringFenceLock);
+        WEBGPU_INTERNAL_InsertElementIntoArray(renderer->availableFences, renderer->availableFenceCapacity,
+                                               renderer->availableFenceCount, WebGPUFence *, fence);
+        SDL_UnlockMutex(renderer->acquiringFenceLock);
+    }
 }
 
 static WebGPUFence *WEBGPU_INTERNAL_CreateFenceFromFuture(WGPUFuture future)
@@ -1995,6 +2040,7 @@ static WebGPUFence *WEBGPU_INTERNAL_CreateFenceFromFuture(WGPUFuture future)
     return fence;
 }
 
+// Not locked: a fence is only polled from one thread in this build; see the threading note at the top of the file.
 static bool WEBGPU_INTERNAL_QueryFence(WebGPURenderer *renderer, WebGPUFence *fence)
 {
     if (fence != NULL) {
@@ -2052,7 +2098,7 @@ static bool WEBGPU_Wait(SDL_GPURenderer *driverData)
 
     SDL_LockMutex(renderer->submittingCommandBufferLock);
     for (Uint32 i = 0; i < renderer->submittedCommandBufferCount; i++) {
-        WEBGPU_INTERNAL_WaitForFences(renderer, true, &renderer->submittedCommandBuffers[i]->fence, 1);
+        WEBGPU_INTERNAL_WaitForFences(renderer, true, &renderer->submittedCommandBuffers[i]->submitted.fence, 1);
     }
     SDL_UnlockMutex(renderer->submittingCommandBufferLock);
 
@@ -2713,41 +2759,38 @@ static void WEBGPU_INTERNAL_TrimBindGroupCache(WebGPURenderer *renderer)
     SDL_IterateHashTable(renderer->bindGroupHashTable, WEBGPU_INTERNAL_BindGroupCacheIteratorCallback, renderer);
 }
 
+static void WEBGPU_INTERNAL_ReleaseTrackedResources(WebGPUSubmittedCommandBuffer *submitted)
+{
+    for (int i = 0; i < submitted->usedBufferCount; i++) {
+        (void)SDL_AtomicDecRef(&submitted->usedBuffers[i]->referenceCount);
+    }
+
+    for (int i = 0; i < submitted->usedTextureCount; i++) {
+        (void)SDL_AtomicDecRef(&submitted->usedTextures[i]->referenceCount);
+    }
+
+    submitted->usedTextureCount = 0;
+    submitted->usedBufferCount = 0;
+}
+
+// Returns every command buffer whose submission completed to the pool, and keeps the rest in submission order.
 static void WEBGPU_INTERNAL_CheckSubmittedCommandBuffers(WebGPURenderer *renderer)
 {
-    // We create a new buffer to store the non-completed command buffers.
-    // Unoptimized? Yes.
-    // Do I care? No.
-    WebGPUSubmittedCommandBuffer **notCompleted = NULL;
-    Uint32 notCompletedCapacity = 0;
     Uint32 notCompletedCount = 0;
 
-    if (renderer->submittedCommandBufferCount == 0) {
-        return;
-    }
+    for (Uint32 i = 0; i < renderer->submittedCommandBufferCount; i++) {
+        WebGPUCommandBuffer *current = renderer->submittedCommandBuffers[i];
 
-    for (int i = renderer->submittedCommandBufferCount; i-- > 0;) {
-        WebGPUSubmittedCommandBuffer *current = renderer->submittedCommandBuffers[i];
-
-        if (current == NULL) {
-            SDL_LogError(SDL_LOG_CATEGORY_GPU, "Submitted command buffer is NULL!");
-            continue;
-        }
-
-        if (!WEBGPU_INTERNAL_QueryFence(renderer, current->fence)) {
-            // Still not done, let's shove it into notCompleted.
-            WEBGPU_INTERNAL_InsertElementIntoArray(notCompleted, notCompletedCapacity, notCompletedCount, WebGPUSubmittedCommandBuffer *, current);
+        if (WEBGPU_INTERNAL_QueryFence(renderer, current->submitted.fence)) {
+            WEBGPU_INTERNAL_ReleaseTrackedResources(&current->submitted);
+            WEBGPU_INTERNAL_ReleaseFence(renderer, current->submitted.fence);
+            WEBGPU_INTERNAL_ReturnCommandBufferToPool(renderer, current);
         } else {
-            WEBGPU_INTERNAL_QueueSubmittedCommandBufferForRelease(renderer, current);
+            renderer->submittedCommandBuffers[notCompletedCount++] = current;
         }
     }
 
-    // By now, all of the entries within submittedCommandBuffers should either have been queued for
-    // release, or moved to notCompleted. We'll free submittedCommandBuffers and replace it with notCompleted.
-    SDL_free(renderer->submittedCommandBuffers);
-    renderer->submittedCommandBufferCapacity = notCompletedCapacity;
     renderer->submittedCommandBufferCount = notCompletedCount;
-    renderer->submittedCommandBuffers = notCompleted;
 }
 
 // Retires every submission without waiting for its fence, for a device whose futures may never complete.
@@ -2757,12 +2800,10 @@ static void WEBGPU_INTERNAL_AbandonSubmittedCommandBuffers(WebGPURenderer *rende
     SDL_LockMutex(renderer->submittingCommandBufferLock);
 
     for (int i = 0; i < renderer->submittedCommandBufferCount; i++) {
-        WebGPUSubmittedCommandBuffer *current = renderer->submittedCommandBuffers[i];
-        if (current != NULL) {
-            WEBGPU_INTERNAL_ForgetFuture((double)current->fence->future.future.id);
-            current->fence = NULL;
-            WEBGPU_INTERNAL_QueueSubmittedCommandBufferForRelease(renderer, current);
-        }
+        WebGPUCommandBuffer *current = renderer->submittedCommandBuffers[i];
+        WEBGPU_INTERNAL_ForgetFuture((double)current->submitted.fence->future.future.id);
+        WEBGPU_INTERNAL_ReleaseTrackedResources(&current->submitted);
+        WEBGPU_INTERNAL_ReturnCommandBufferToPool(renderer, current);
     }
     renderer->submittedCommandBufferCount = 0;
 
@@ -2775,41 +2816,22 @@ static void WEBGPU_INTERNAL_ReleaseSampler(WebGPURenderer *renderer, WebGPUSampl
 static void WEBGPU_INTERNAL_ReleaseBuffer(WebGPURenderer *renderer, WebGPUBuffer *buffer);
 static void WEBGPU_INTERNAL_ReleaseBufferContainer(WebGPURenderer *renderer, WebGPUBufferContainer *container);
 
-static void WEBGPU_INTERNAL_ReleaseTrackedResources(WebGPUSubmittedCommandBuffer *submitted)
-{
-    for (int i = 0; i < submitted->usedBufferCount; i++) {
-        (void)SDL_AtomicDecRef(&submitted->usedBuffers[i]->referenceCount);
-    }
-
-    for (int i = 0; i < submitted->usedTextureCount; i++) {
-        (void)SDL_AtomicDecRef(&submitted->usedTextures[i]->referenceCount);
-    }
-
-    SDL_free(submitted->usedTextures);
-    SDL_free(submitted->usedBuffers);
-    submitted->usedTextures = NULL;
-    submitted->usedBuffers = NULL;
-    submitted->usedTextureCount = submitted->usedTextureCapacity = 0;
-    submitted->usedBufferCount = submitted->usedBufferCapacity = 0;
-}
-
 // forceAll releases every queued resource even while it is still referenced; only a device being destroyed should ask for it.
 static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool forceAll)
 {
-    WebGPUQueuedDestroy **newQueuedDestroys = NULL;
-    Uint32 newQueuedDestroysCapacity = 0;
-    Uint32 newQueuedDestroysCount = 0;
+    Uint32 keptCount = 0;
 
     // Submit and the reap paths both touch submittedCommandBuffers, and both locks are recursive,
     // so this is safe to call from inside WEBGPU_Submit as well.
     SDL_LockMutex(renderer->submittingCommandBufferLock);
     SDL_LockMutex(renderer->registeringQueuedDestroyLock);
 
-    // This needs to be run before the destruction loop since this function
-    // is what queues the submitted command buffers for freeing.
+    // This needs to be run before the destruction loop since completed submissions drop their resource references.
     WEBGPU_INTERNAL_CheckSubmittedCommandBuffers(renderer);
     WEBGPU_INTERNAL_TrimBindGroupCache(renderer);
 
+    // Kept entries are compacted to the front in place. A release that queues another destroy appends it behind i,
+    // so this pass handles it too.
     if (renderer->queuedDestroys != NULL && renderer->queuedDestroyCount > 0) {
         for (int i = 0; i < renderer->queuedDestroyCount; i++) {
             WebGPUQueuedDestroy *current = renderer->queuedDestroys[i];
@@ -2885,28 +2907,6 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
                     wasReleased = true;
                 }
                 break;
-            case WEBGPU_QUEUED_DESTROY_FENCE:
-                // The fence callback writes into the fence, so it can only be freed once signaled.
-                if (WEBGPU_INTERNAL_QueryFence(renderer, current->resource.fence)) {
-                    SDL_free(current->resource.fence);
-                    wasReleased = true;
-                } else if (forciblyDestroy) {
-                    // Leak it on purpose rather than free memory a late callback could still write to.
-                    WEBGPU_INTERNAL_ForgetFuture((double)current->resource.fence->future.future.id);
-                    SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Fence never signaled; dropping it from the destroy queue without freeing.");
-                    wasReleased = true;
-                }
-                break;
-            case WEBGPU_QUEUED_DESTROY_SUBMITTED_COMMAND_BUFFER:
-                // NOTE: I disabled this. I'm sure this won't come back to bite me in the ass.
-                // WEBGPU_INTERNAL_WaitForFences(renderer, true, &current->resource.submittedCommandBuffer->fence, 1);
-
-                WEBGPU_INTERNAL_ReleaseTrackedResources(current->resource.submittedCommandBuffer);
-                SDL_free(current->resource.submittedCommandBuffer->fence);
-                SDL_free(current->resource.submittedCommandBuffer);
-
-                wasReleased = true;
-                break;
             case WEBGPU_QUEUED_DESTROY_BIND_GROUP:
                 // FIXME: Bind groups don't have any reference counts, so there might be some issues with in-flight usages?
                 SDL_RemoveFromHashTable(renderer->bindGroupHashTable, &current->resource.bindGroup->key); // The key value destruction function also releases the bind group.
@@ -2918,17 +2918,12 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
             if (wasReleased) {
                 SDL_free(current);
             } else {
-                WEBGPU_INTERNAL_InsertElementIntoArray(newQueuedDestroys, newQueuedDestroysCapacity,
-                                                       newQueuedDestroysCount, WebGPUQueuedDestroy *, current);
+                renderer->queuedDestroys[keptCount++] = current;
                 current->destroysAttempted++;
             }
         }
 
-        SDL_free(renderer->queuedDestroys);
-
-        renderer->queuedDestroyCapacity = newQueuedDestroysCapacity;
-        renderer->queuedDestroyCount = newQueuedDestroysCount;
-        renderer->queuedDestroys = newQueuedDestroys;
+        renderer->queuedDestroyCount = keptCount;
     }
 
     SDL_UnlockMutex(renderer->registeringQueuedDestroyLock);
@@ -3291,10 +3286,9 @@ static WGPUBindGroup WEBGPU_INTERNAL_GetBindGroup(WebGPUCommandBuffer *cmdBuf, W
     return result->bindGroup;
 }
 
-static WebGPUTextureView *WEBGPU_INTERNAL_CreateTextureView(WebGPURenderer *renderer, WebGPUTexture *texture, int depth, int mipLevel)
+// Gives view a new WebGPU view of texture and a new identifier.
+static void WEBGPU_INTERNAL_InitTextureView(WebGPURenderer *renderer, WebGPUTexture *texture, int depth, int mipLevel, WebGPUTextureView *view)
 {
-    WebGPUTextureView *result = NULL;
-
     WGPUTextureFormat format = wgpuTextureGetFormat(texture->texture);
     WGPUTextureUsage usages = wgpuTextureGetUsage(texture->texture);
     WGPUTextureViewDimension dimension = WGPUTextureViewDimension_Undefined;
@@ -3342,12 +3336,15 @@ static WebGPUTextureView *WEBGPU_INTERNAL_CreateTextureView(WebGPURenderer *rend
         desc.baseMipLevel = mipLevel;
     }
 
-    result = SDL_calloc(1, sizeof(*result));
+    view->identifier = renderer->nextBindableResourceID++;
+    view->view = wgpuTextureCreateView(texture->texture, &desc);
+    view->format = format;
+}
 
-    result->identifier = renderer->nextBindableResourceID++;
-    result->view = wgpuTextureCreateView(texture->texture, &desc);
-    result->format = format;
-
+static WebGPUTextureView *WEBGPU_INTERNAL_CreateTextureView(WebGPURenderer *renderer, WebGPUTexture *texture, int depth, int mipLevel)
+{
+    WebGPUTextureView *result = SDL_calloc(1, sizeof(*result));
+    WEBGPU_INTERNAL_InitTextureView(renderer, texture, depth, mipLevel, result);
     return result;
 }
 
@@ -3627,6 +3624,53 @@ static bool WEBGPU_ClaimWindow(SDL_GPURenderer *device, SDL_Window *window)
     return true;
 }
 
+// Takes a pooled swapchain texture wrapper, or allocates one: a container with one 2D texture, its full view and one slice view.
+static WebGPUTextureContainer *WEBGPU_INTERNAL_AcquireSwapchainTextureContainer(WebGPURenderer *renderer)
+{
+    WebGPUTextureContainer *container = NULL;
+    WebGPUTexture *texture;
+
+    SDL_LockMutex(renderer->acquiringSwapchainTextureLock);
+    if (renderer->availableSwapchainTextureCount > 0) {
+        container = renderer->availableSwapchainTextures[--renderer->availableSwapchainTextureCount];
+    }
+    SDL_UnlockMutex(renderer->acquiringSwapchainTextureLock);
+
+    if (container != NULL) {
+        return container;
+    }
+
+    texture = SDL_calloc(1, sizeof(*texture));
+    texture->aspect = WGPUTextureAspect_All;
+    texture->fullTextureView = SDL_calloc(1, sizeof(WebGPUTextureView));
+    texture->textureViews = SDL_calloc(1, sizeof(WebGPUTextureView *));
+    texture->textureViews[0] = SDL_calloc(1, sizeof(WebGPUTextureView));
+    texture->textureViewCount = 1;
+    texture->textureViewCapacity = 1;
+
+    container = SDL_calloc(1, sizeof(*container));
+    container->textures = SDL_calloc(1, sizeof(WebGPUTexture *));
+    container->textures[0] = texture;
+    container->textureCount = 1;
+    container->textureCapacity = 1;
+    container->activeTexture = texture;
+    texture->container = container;
+
+    return container;
+}
+
+static void WEBGPU_INTERNAL_FreeSwapchainTextureContainer(WebGPUTextureContainer *container)
+{
+    WebGPUTexture *texture = container->activeTexture;
+
+    SDL_free(texture->textureViews[0]);
+    SDL_free(texture->textureViews);
+    SDL_free(texture->fullTextureView);
+    SDL_free(texture);
+    SDL_free(container->textures);
+    SDL_free(container);
+}
+
 static bool WEBGPU_AcquireSwapchainTexture(SDL_GPUCommandBuffer *commandBuffer, SDL_Window *window, SDL_GPUTexture **swapchainTexture, Uint32 *width, Uint32 *height)
 {
     WebGPUCommandBuffer *cmdBuf = (WebGPUCommandBuffer *)commandBuffer;
@@ -3643,7 +3687,6 @@ static bool WEBGPU_AcquireSwapchainTexture(SDL_GPUCommandBuffer *commandBuffer, 
     WebGPUWindowData *windowData = SDL_GetPointerProperty(SDL_GetWindowProperties(window), WINDOW_PROPERTY_DATA, NULL);
 
     WebGPUTexture *texture;
-    WebGPUTexture **textureArray;
     WebGPUTextureContainer *container;
 
     if (windowData->surfaceDirty) {
@@ -3663,28 +3706,14 @@ static bool WEBGPU_AcquireSwapchainTexture(SDL_GPUCommandBuffer *commandBuffer, 
         return false;
     }
 
-    textureArray = SDL_calloc(1, sizeof(WebGPUTexture *));
-    texture = SDL_calloc(1, sizeof(WebGPUTexture));
-    container = (WebGPUTextureContainer *)SDL_calloc(1, sizeof(*container));
+    container = WEBGPU_INTERNAL_AcquireSwapchainTextureContainer(cmdBuf->renderer);
+    texture = container->activeTexture;
 
-    textureArray[0] = texture;
-    texture->container = container;
-
+    // The reference count is left alone: submissions of earlier frames may still hold references to this wrapper.
     texture->texture = surfaceTexture.texture;
-    texture->aspect = WGPUTextureAspect_All;
-    SDL_SetAtomicInt(&texture->referenceCount, 0);
     texture->format = SwapchainCompositionToSDLFormat(windowData->swapchainComposition, windowData->shouldUseFallbackFormat);
-    texture->fullTextureView = WEBGPU_INTERNAL_CreateTextureView(cmdBuf->renderer, texture, -1, 0);
-
-    WebGPUTextureView *textureView = WEBGPU_INTERNAL_CreateTextureView(cmdBuf->renderer, texture, 0, 0);
-    WEBGPU_INTERNAL_InsertElementIntoArray(texture->textureViews, texture->textureViewCapacity,
-                                           texture->textureViewCount, WebGPUTextureView *, textureView);
-
-    container->textureCapacity = 1;
-    container->textureCount = 1;
-    container->textures = textureArray;
-    container->activeTexture = texture;
-    container->activeTextureIndex = 0;
+    WEBGPU_INTERNAL_InitTextureView(cmdBuf->renderer, texture, -1, 0, texture->fullTextureView);
+    WEBGPU_INTERNAL_InitTextureView(cmdBuf->renderer, texture, 0, 0, texture->textureViews[0]);
 
     container->header.info.width = wgpuTextureGetWidth(texture->texture);
     container->header.info.height = wgpuTextureGetHeight(texture->texture);
@@ -3694,11 +3723,8 @@ static bool WEBGPU_AcquireSwapchainTexture(SDL_GPUCommandBuffer *commandBuffer, 
     container->header.info.num_levels = 1;
     container->header.info.props = 0;
 
-    EXPAND_ARRAY_IF_NEEDED(cmdBuf->surfaces, WGPUSurface, cmdBuf->surfaceCount + 1, cmdBuf->surfaceCapacity, cmdBuf->surfaceCapacity + 1);
-    cmdBuf->surfaces[cmdBuf->surfaceCount++] = windowData->surface;
-
-    EXPAND_ARRAY_IF_NEEDED(cmdBuf->acquiredSwapchainTextures, WebGPUTextureContainer *, cmdBuf->swapchainTextureCount + 1, cmdBuf->swapchainTextureCapacity, cmdBuf->swapchainTextureCapacity + 1);
-    cmdBuf->acquiredSwapchainTextures[cmdBuf->swapchainTextureCount++] = container;
+    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->surfaces, cmdBuf->surfaceCapacity, cmdBuf->surfaceCount, WGPUSurface, windowData->surface);
+    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->acquiredSwapchainTextures, cmdBuf->swapchainTextureCapacity, cmdBuf->swapchainTextureCount, WebGPUTextureContainer *, container);
 
     *swapchainTexture = (SDL_GPUTexture *)container;
     if (width != NULL) {
@@ -3962,7 +3988,7 @@ static void WEBGPU_ReleaseGraphicsPipeline(SDL_GPURenderer *device, SDL_GPUGraph
 
 static void WEBGPU_ReleaseFence(SDL_GPURenderer *device, SDL_GPUFence *fence)
 {
-    WEBGPU_INTERNAL_QueueFenceForRelease((WebGPURenderer *)device, (WebGPUFence *)fence);
+    WEBGPU_INTERNAL_ReleaseFence((WebGPURenderer *)device, (WebGPUFence *)fence);
 }
 
 static SDL_GPUShader *WEBGPU_INTERNAL_CreateBlitFragmentShader(WebGPURenderer *renderer, const char *source, bool unfilterable)
@@ -4325,7 +4351,8 @@ finish:
 
 static void WEBGPU_INTERNAL_CycleTextureContainer(WebGPURenderer *renderer, WebGPUTextureContainer *container)
 {
-    if (SDL_GetAtomicInt(&container->activeTexture->referenceCount) == 0) {
+    // Swapchain textures cannot be cycled: the surface texture is the one presented.
+    if (!container->canBeCycled || SDL_GetAtomicInt(&container->activeTexture->referenceCount) == 0) {
         goto finish;
     }
 
@@ -4568,6 +4595,7 @@ static void *WEBGPU_INTERNAL_ApplyDownloadRepacks(WebGPURenderer *renderer, WebG
 
 static void *WEBGPU_MapTransferBuffer(SDL_GPURenderer *device, SDL_GPUTransferBuffer *transferBuffer, bool cycle)
 {
+    // Always true in this build; see the threading note at the top of the file.
     bool isMainThread = SDL_GetCurrentThreadID() == ((WebGPURenderer *)device)->createdByThreadID;
 
     if (cycle) {
@@ -4865,10 +4893,8 @@ static void WEBGPU_BeginRenderPass(SDL_GPUCommandBuffer *commandBuffer, const SD
 
     WGPURenderPassDescriptor desc = { 0 };
 
-    WGPURenderPassColorAttachment *colorAttachments;
-    WGPURenderPassDepthStencilAttachment *depthStencilAttachment = NULL;
-
-    colorAttachments = (WGPURenderPassColorAttachment *)SDL_calloc(numColorTargets, sizeof(*colorAttachments));
+    WGPURenderPassColorAttachment colorAttachments[MAX_COLOR_TARGET_BINDINGS] = { 0 };
+    WGPURenderPassDepthStencilAttachment depthStencilAttachment = { 0 };
 
     wrapper->renderAreaW = SDL_MAX_UINT32;
     wrapper->renderAreaH = SDL_MAX_UINT32;
@@ -4915,21 +4941,19 @@ static void WEBGPU_BeginRenderPass(SDL_GPUCommandBuffer *commandBuffer, const SD
     if (depthStencilTargetInfo != NULL) {
         SDL_GPUTextureFormat textureFormat = ((WebGPUTextureContainer *)depthStencilTargetInfo->texture)->header.info.format;
         WEBGPU_INTERNAL_TrackRenderArea(wrapper, ((WebGPUTextureContainer *)depthStencilTargetInfo->texture)->activeTexture->texture, depthStencilTargetInfo->mip_level);
-        depthStencilAttachment = (WGPURenderPassDepthStencilAttachment *)SDL_calloc(1, sizeof(*depthStencilAttachment));
-
-        depthStencilAttachment->depthClearValue = depthStencilTargetInfo->clear_depth;
-        depthStencilAttachment->depthLoadOp = SDLToWebGPU_LoadOp[depthStencilTargetInfo->load_op];
-        depthStencilAttachment->depthStoreOp = SDLToWebGPU_StoreOp[depthStencilTargetInfo->store_op];
-        depthStencilAttachment->stencilClearValue = IsStencilFormat(textureFormat) ? depthStencilTargetInfo->clear_stencil : 0;
-        depthStencilAttachment->stencilLoadOp = IsStencilFormat(textureFormat) ? SDLToWebGPU_LoadOp[depthStencilTargetInfo->stencil_load_op] : WGPULoadOp_Undefined;
-        depthStencilAttachment->stencilStoreOp = IsStencilFormat(textureFormat) ? SDLToWebGPU_StoreOp[depthStencilTargetInfo->stencil_store_op] : WGPUStoreOp_Undefined;
-        depthStencilAttachment->view =
+        depthStencilAttachment.depthClearValue = depthStencilTargetInfo->clear_depth;
+        depthStencilAttachment.depthLoadOp = SDLToWebGPU_LoadOp[depthStencilTargetInfo->load_op];
+        depthStencilAttachment.depthStoreOp = SDLToWebGPU_StoreOp[depthStencilTargetInfo->store_op];
+        depthStencilAttachment.stencilClearValue = IsStencilFormat(textureFormat) ? depthStencilTargetInfo->clear_stencil : 0;
+        depthStencilAttachment.stencilLoadOp = IsStencilFormat(textureFormat) ? SDLToWebGPU_LoadOp[depthStencilTargetInfo->stencil_load_op] : WGPULoadOp_Undefined;
+        depthStencilAttachment.stencilStoreOp = IsStencilFormat(textureFormat) ? SDLToWebGPU_StoreOp[depthStencilTargetInfo->stencil_store_op] : WGPUStoreOp_Undefined;
+        depthStencilAttachment.view =
             ((WebGPUTextureContainer *)depthStencilTargetInfo->texture)->activeTexture->textureViews[WEBGPU_INTERNAL_GetTextureViewIndex(depthStencilTargetInfo->layer, depthStencilTargetInfo->mip_level, wgpuTextureGetMipLevelCount(((WebGPUTextureContainer *)depthStencilTargetInfo->texture)->activeTexture->texture))]->view;
     }
 
     desc.colorAttachments = colorAttachments;
     desc.colorAttachmentCount = numColorTargets;
-    desc.depthStencilAttachment = depthStencilTargetInfo != NULL ? depthStencilAttachment : NULL;
+    desc.depthStencilAttachment = depthStencilTargetInfo != NULL ? &depthStencilAttachment : NULL;
     desc.occlusionQuerySet = NULL; // Unimplemented in SDLGPU
     desc.timestampWrites = NULL;   // Unimplemented in SDLGPU as of 2026-06-03, although, there is a proof of concept Query API in development right now.
     desc.label = (WGPUStringView){ NULL, WGPU_STRLEN };
@@ -4937,9 +4961,6 @@ static void WEBGPU_BeginRenderPass(SDL_GPUCommandBuffer *commandBuffer, const SD
     wrapper->renderPassEncoder = wgpuCommandEncoderBeginRenderPass(wrapper->encoder, &desc);
     wrapper->boundGraphicsPipeline = NULL;
     wrapper->hasBoundGraphicsPipeline = false;
-
-    SDL_free(colorAttachments);
-    SDL_free(depthStencilAttachment);
 }
 
 static void WEBGPU_SetViewport(SDL_GPUCommandBuffer *renderPass, const SDL_GPUViewport *viewport)
@@ -4955,20 +4976,32 @@ static void WEBGPU_SetViewport(SDL_GPUCommandBuffer *renderPass, const SDL_GPUVi
     wgpuRenderPassEncoderSetViewport(cmdBuf->renderPassEncoder, x, y, w, h, minDepth, maxDepth);
 }
 
+// Copies the data into the staging area, which is reused after submit, and queues its upload to uniform buffer slot at offset.
+static void WEBGPU_INTERNAL_QueueUniformUpload(WebGPUCommandBuffer *cmdBuf, Uint32 slot, Uint32 offset, const void *data, Uint32 length)
+{
+    WebGPUQueuedUniformDataUpload upload = {
+        .stagingOffset = cmdBuf->uniformStagingSize,
+        .length = ALIGN_VALUE(length, 256),
+        .offset = offset,
+        .slot = slot,
+    };
+
+    if (cmdBuf->uniformStagingSize + upload.length > cmdBuf->uniformStagingCapacity) {
+        cmdBuf->uniformStagingCapacity = SDL_max(cmdBuf->uniformStagingCapacity * 2, cmdBuf->uniformStagingSize + upload.length);
+        cmdBuf->uniformStaging = (Uint8 *)SDL_realloc(cmdBuf->uniformStaging, cmdBuf->uniformStagingCapacity);
+    }
+    SDL_memcpy(cmdBuf->uniformStaging + upload.stagingOffset, data, length);
+    cmdBuf->uniformStagingSize += upload.length;
+
+    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->queuedUniformUploads, cmdBuf->queuedUniformUploadCapacity,
+                                           cmdBuf->numQueuedUniformUploads, WebGPUQueuedUniformDataUpload, upload);
+}
+
 static void WEBGPU_PushVertexUniformData(SDL_GPUCommandBuffer *commandBuffer, Uint32 slotIndex, const void *data, uint32_t length)
 {
     WebGPUCommandBuffer *cmdBuf = (WebGPUCommandBuffer *)commandBuffer;
 
-    WebGPUQueuedUniformDataUpload upload = {
-        .data = SDL_malloc(ALIGN_VALUE(length, 256)),
-        .length = ALIGN_VALUE(length, 256),
-        .offset = cmdBuf->vertexStageBinds.currentUniformWriteOffsets[slotIndex],
-        .slot = slotIndex,
-    };
-    SDL_memcpy(upload.data, data, length);
-
-    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->queuedUniformUploads, cmdBuf->queuedUniformUploadCapacity,
-                                           cmdBuf->numQueuedUniformUploads, WebGPUQueuedUniformDataUpload, upload);
+    WEBGPU_INTERNAL_QueueUniformUpload(cmdBuf, slotIndex, cmdBuf->vertexStageBinds.currentUniformWriteOffsets[slotIndex], data, length);
 
     // jank and gross but it works
     cmdBuf->vertexStageBinds.currentUniformReadOffsets[slotIndex] = cmdBuf->vertexStageBinds.currentUniformWriteOffsets[slotIndex];
@@ -4980,16 +5013,7 @@ static void WEBGPU_PushFragmentUniformData(SDL_GPUCommandBuffer *commandBuffer, 
 {
     WebGPUCommandBuffer *cmdBuf = (WebGPUCommandBuffer *)commandBuffer;
 
-    WebGPUQueuedUniformDataUpload upload = {
-        .data = SDL_malloc(ALIGN_VALUE(length, 256)),
-        .length = ALIGN_VALUE(length, 256),
-        .offset = cmdBuf->fragmentStageBinds.currentUniformWriteOffsets[slotIndex],
-        .slot = 4 + slotIndex,
-    };
-    SDL_memcpy(upload.data, data, length);
-
-    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->queuedUniformUploads, cmdBuf->queuedUniformUploadCapacity,
-                                           cmdBuf->numQueuedUniformUploads, WebGPUQueuedUniformDataUpload, upload);
+    WEBGPU_INTERNAL_QueueUniformUpload(cmdBuf, 4 + slotIndex, cmdBuf->fragmentStageBinds.currentUniformWriteOffsets[slotIndex], data, length);
 
     cmdBuf->fragmentStageBinds.currentUniformReadOffsets[slotIndex] = cmdBuf->fragmentStageBinds.currentUniformWriteOffsets[slotIndex];
     cmdBuf->fragmentStageBinds.currentUniformWriteOffsets[slotIndex] += ALIGN_VALUE(length, 256);
@@ -5000,16 +5024,7 @@ static void WEBGPU_PushComputeUniformData(SDL_GPUCommandBuffer *commandBuffer, U
 {
     WebGPUCommandBuffer *cmdBuf = (WebGPUCommandBuffer *)commandBuffer;
 
-    WebGPUQueuedUniformDataUpload upload = {
-        .data = SDL_malloc(ALIGN_VALUE(length, 256)),
-        .length = ALIGN_VALUE(length, 256),
-        .offset = cmdBuf->computeStageBinds.currentUniformWriteOffsets[slotIndex],
-        .slot = 8 + slotIndex,
-    };
-    SDL_memcpy(upload.data, data, length);
-
-    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->queuedUniformUploads, cmdBuf->queuedUniformUploadCapacity,
-                                           cmdBuf->numQueuedUniformUploads, WebGPUQueuedUniformDataUpload, upload);
+    WEBGPU_INTERNAL_QueueUniformUpload(cmdBuf, 8 + slotIndex, cmdBuf->computeStageBinds.currentUniformWriteOffsets[slotIndex], data, length);
 
     cmdBuf->computeStageBinds.currentUniformReadOffsets[slotIndex] = cmdBuf->computeStageBinds.currentUniformWriteOffsets[slotIndex];
     cmdBuf->computeStageBinds.currentUniformWriteOffsets[slotIndex] += ALIGN_VALUE(length, 256);
@@ -5594,18 +5609,24 @@ static void WEBGPU_DispatchComputeIndirect(SDL_GPUCommandBuffer *commandBuffer, 
     wgpuComputePassEncoderDispatchWorkgroupsIndirect(cmdBuf->computePassEncoder, ((WebGPUBufferContainer *)buffer)->activeBuffer->buffer, offset);
 }
 
+// Releases the WebGPU objects of the acquired swapchain textures and returns their wrappers to the pool.
 static void WEBGPU_INTERNAL_ReleaseAcquiredSwapchainTextures(WebGPUCommandBuffer *cmdBuf)
 {
+    WebGPURenderer *renderer = cmdBuf->renderer;
+
+    SDL_LockMutex(renderer->acquiringSwapchainTextureLock);
     for (int i = 0; i < cmdBuf->swapchainTextureCount; i++) {
         WebGPUTextureContainer *container = cmdBuf->acquiredSwapchainTextures[i];
+        WebGPUTexture *texture = container->activeTexture;
 
-        for (int j = 0; j < container->textureCount; j++) {
-            WEBGPU_INTERNAL_ReleaseTexture(cmdBuf->renderer, container->textures[j]);
-        }
+        wgpuTextureViewRelease(texture->fullTextureView->view);
+        wgpuTextureViewRelease(texture->textureViews[0]->view);
+        wgpuTextureRelease(texture->texture);
 
-        SDL_free(container->textures);
-        SDL_free(container);
+        WEBGPU_INTERNAL_InsertElementIntoArray(renderer->availableSwapchainTextures, renderer->availableSwapchainTextureCapacity,
+                                               renderer->availableSwapchainTextureCount, WebGPUTextureContainer *, container);
     }
+    SDL_UnlockMutex(renderer->acquiringSwapchainTextureLock);
 
     cmdBuf->swapchainTextureCount = 0;
     cmdBuf->surfaceCount = 0;
@@ -5616,19 +5637,20 @@ static void WEBGPU_INTERNAL_UploadQueuedUniformData(WebGPUCommandBuffer *cmdBuf)
     for (int i = 0; i < cmdBuf->numQueuedUniformUploads; i++) {
         WebGPUQueuedUniformDataUpload upload = cmdBuf->queuedUniformUploads[i];
 
-        wgpuQueueWriteBuffer(cmdBuf->queue, cmdBuf->renderer->uniformBuffers[upload.slot]->activeBuffer->buffer, upload.offset, upload.data, upload.length);
-        SDL_free(upload.data);
+        wgpuQueueWriteBuffer(cmdBuf->queue, cmdBuf->renderer->uniformBuffers[upload.slot]->activeBuffer->buffer, upload.offset, cmdBuf->uniformStaging + upload.stagingOffset, upload.length);
     }
 
     cmdBuf->numQueuedUniformUploads = 0;
+    cmdBuf->uniformStagingSize = 0;
 }
 
-static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
+// The command buffer stays in submittedCommandBuffers until its fence signals, and then returns to the pool.
+// With acquiredFence, the app gets the submission's fence with a reference of its own.
+static bool WEBGPU_INTERNAL_Submit(WebGPUCommandBuffer *wrapper, WebGPUFence **acquiredFence)
 {
-    WebGPUCommandBuffer *wrapper = (WebGPUCommandBuffer *)commandBuffer;
-    WebGPUSubmittedCommandBuffer *submitted = NULL;
     WebGPURenderer *renderer = wrapper->renderer;
 
+    // Always true in this build; see the threading note at the top of the file.
     bool isMainThread = SDL_GetCurrentThreadID() == renderer->createdByThreadID;
 
     SDL_LockMutex(renderer->submittingCommandBufferLock);
@@ -5639,20 +5661,17 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
     }
 
 #ifdef _MSC_VER
-    WGPUCommandBuffer cmdBuf = wgpuCommandEncoderFinish((((WebGPUCommandBuffer *)commandBuffer)->encoder), &(WGPUCommandBufferDescriptor)WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT);
+    WGPUCommandBuffer cmdBuf = wgpuCommandEncoderFinish(wrapper->encoder, &(WGPUCommandBufferDescriptor)WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT);
 #else
-    WGPUCommandBuffer cmdBuf = wgpuCommandEncoderFinish((((WebGPUCommandBuffer *)commandBuffer)->encoder), &WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT);
+    WGPUCommandBuffer cmdBuf = wgpuCommandEncoderFinish(wrapper->encoder, &WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT);
 #endif
 
     if (!cmdBuf) {
-        for (int i = 0; i < wrapper->numQueuedUniformUploads; i++) {
-            SDL_free(wrapper->queuedUniformUploads[i].data);
-        }
         WEBGPU_INTERNAL_DropQueuedRepacks(wrapper);
         WEBGPU_INTERNAL_ReleaseTrackedResources(&wrapper->submitted);
         WEBGPU_INTERNAL_ReleaseAcquiredSwapchainTextures(wrapper);
         wgpuCommandEncoderRelease(wrapper->encoder);
-        WEBGPU_INTERNAL_FreeCommandBuffer(wrapper);
+        WEBGPU_INTERNAL_ReturnCommandBufferToPool(renderer, wrapper);
         SDL_UnlockMutex(renderer->submittingCommandBufferLock);
         return SDL_SetError("Could not finish WebGPU command encoder!");
     }
@@ -5660,13 +5679,14 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
     wgpuQueueSubmit(wrapper->queue, 1, &cmdBuf);
 
     // onSubmittedWorkDone only covers work submitted before it, so the fence has to follow the submit.
-    wrapper->submitted.fence = WEBGPU_INTERNAL_CreateFence(wrapper->queue);
+    wrapper->submitted.fence = WEBGPU_INTERNAL_AcquireFence(renderer);
+    if (acquiredFence != NULL) {
+        SDL_AtomicIncRef(&wrapper->submitted.fence->referenceCount);
+        *acquiredFence = wrapper->submitted.fence;
+    }
 
-    submitted = SDL_calloc(1, sizeof(*submitted));
-    *submitted = wrapper->submitted;
-
-    WEBGPU_INTERNAL_InsertElementIntoArray(wrapper->renderer->submittedCommandBuffers, wrapper->renderer->submittedCommandBufferCapacity,
-                                           wrapper->renderer->submittedCommandBufferCount, WebGPUSubmittedCommandBuffer *, submitted);
+    WEBGPU_INTERNAL_InsertElementIntoArray(renderer->submittedCommandBuffers, renderer->submittedCommandBufferCapacity,
+                                           renderer->submittedCommandBufferCount, WebGPUCommandBuffer *, wrapper);
     WEBGPU_INTERNAL_PublishQueuedRepacks(wrapper);
 
     if (isMainThread) {
@@ -5680,27 +5700,29 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
     wgpuCommandEncoderRelease(wrapper->encoder);
     wgpuCommandBufferRelease(cmdBuf);
 
-    wrapper->renderer->numSubmissions++;
+    renderer->numSubmissions++;
 
-    // We'll be freeing the "command buffer", so any usage of it will be undefined behaviour.
+    // The "command buffer" will be reused once its submission completes, so any usage of it will be undefined behaviour.
     // Don't. The docs tell you not to.
-
-    WEBGPU_INTERNAL_FreeCommandBuffer(wrapper);
 
     SDL_UnlockMutex(renderer->submittingCommandBufferLock);
     return true;
 }
 
+static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
+{
+    return WEBGPU_INTERNAL_Submit((WebGPUCommandBuffer *)commandBuffer, NULL);
+}
+
 static SDL_GPUFence *WEBGPU_SubmitAndAcquireFence(SDL_GPUCommandBuffer *commandBuffer)
 {
-    // Submit frees the wrapper, so grab the queue first.
-    WGPUQueue queue = ((WebGPUCommandBuffer *)commandBuffer)->queue;
+    WebGPUFence *fence = NULL;
 
-    if (!WEBGPU_Submit(commandBuffer)) {
+    if (!WEBGPU_INTERNAL_Submit((WebGPUCommandBuffer *)commandBuffer, &fence)) {
         return NULL;
     }
 
-    return (SDL_GPUFence *)WEBGPU_INTERNAL_CreateFence(queue);
+    return (SDL_GPUFence *)fence;
 }
 
 static void WEBGPU_INTERNAL_ReleaseWebGPUObjects(WebGPURenderer *renderer)
@@ -5731,6 +5753,9 @@ static void WEBGPU_INTERNAL_DestroyPartialRenderer(WebGPURenderer *renderer)
     SDL_DestroyMutex(renderer->destroyingSelfLock);
     SDL_DestroyMutex(renderer->registeringQueuedDestroyLock);
     SDL_DestroyMutex(renderer->submittingCommandBufferLock);
+    SDL_DestroyMutex(renderer->acquiringCommandBufferLock);
+    SDL_DestroyMutex(renderer->acquiringFenceLock);
+    SDL_DestroyMutex(renderer->acquiringSwapchainTextureLock);
     SDL_DestroyMutex(renderer->creatingWebGPUResourceLock);
     SDL_DestroyMutex(renderer->claimingWindowLock);
     SDL_DestroyHashTable(renderer->bindGroupHashTable);
@@ -5797,6 +5822,9 @@ static void WEBGPU_DestroyDevice(SDL_GPUDevice *device)
     SDL_DestroyMutex(renderer->queryingFenceLock);
     SDL_DestroyMutex(renderer->registeringQueuedDestroyLock);
     SDL_DestroyMutex(renderer->submittingCommandBufferLock);
+    SDL_DestroyMutex(renderer->acquiringCommandBufferLock);
+    SDL_DestroyMutex(renderer->acquiringFenceLock);
+    SDL_DestroyMutex(renderer->acquiringSwapchainTextureLock);
     SDL_DestroyMutex(renderer->creatingWebGPUResourceLock);
     SDL_DestroyMutex(renderer->claimingWindowLock);
 
@@ -5807,7 +5835,20 @@ static void WEBGPU_DestroyDevice(SDL_GPUDevice *device)
     SDL_DestroyProperties(renderer->props);
     SDL_UnlockMutex(renderer->destroyingSelfLock);
     SDL_DestroyMutex(renderer->destroyingSelfLock);
+    for (Uint32 i = 0; i < renderer->availableCommandBufferCount; i++) {
+        WEBGPU_INTERNAL_FreeCommandBuffer(renderer->availableCommandBuffers[i]);
+    }
+    for (Uint32 i = 0; i < renderer->availableFenceCount; i++) {
+        SDL_free(renderer->availableFences[i]);
+    }
+    for (Uint32 i = 0; i < renderer->availableSwapchainTextureCount; i++) {
+        WEBGPU_INTERNAL_FreeSwapchainTextureContainer(renderer->availableSwapchainTextures[i]);
+    }
+    SDL_free(renderer->availableCommandBuffers);
+    SDL_free(renderer->availableFences);
+    SDL_free(renderer->availableSwapchainTextures);
     SDL_free(renderer->submittedCommandBuffers);
+    SDL_free(renderer->queuedDestroys);
     SDL_free(renderer->claimedWindows);
     SDL_free(renderer);
     SDL_free(device);
@@ -6156,15 +6197,11 @@ static bool WEBGPU_Cancel(SDL_GPUCommandBuffer *commandBuffer)
 {
     WebGPUCommandBuffer *wrapper = (WebGPUCommandBuffer *)commandBuffer;
 
-    for (int i = 0; i < wrapper->numQueuedUniformUploads; i++) {
-        SDL_free(wrapper->queuedUniformUploads[i].data);
-    }
-
     WEBGPU_INTERNAL_DropQueuedRepacks(wrapper);
     WEBGPU_INTERNAL_ReleaseTrackedResources(&wrapper->submitted);
     WEBGPU_INTERNAL_ReleaseAcquiredSwapchainTextures(wrapper);
     wgpuCommandEncoderRelease(wrapper->encoder);
-    WEBGPU_INTERNAL_FreeCommandBuffer(wrapper);
+    WEBGPU_INTERNAL_ReturnCommandBufferToPool(wrapper->renderer, wrapper);
 
     return true;
 }
@@ -6385,6 +6422,9 @@ static SDL_GPUDevice *WEBGPU_CreateDevice(bool debugMode, bool preferLowPower, S
     renderer->destroyingSelfLock = SDL_CreateMutex();
     renderer->registeringQueuedDestroyLock = SDL_CreateMutex();
     renderer->submittingCommandBufferLock = SDL_CreateMutex();
+    renderer->acquiringCommandBufferLock = SDL_CreateMutex();
+    renderer->acquiringFenceLock = SDL_CreateMutex();
+    renderer->acquiringSwapchainTextureLock = SDL_CreateMutex();
     renderer->creatingWebGPUResourceLock = SDL_CreateMutex();
     renderer->claimingWindowLock = SDL_CreateMutex();
 
