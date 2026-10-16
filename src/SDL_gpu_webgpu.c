@@ -4926,6 +4926,8 @@ static void WEBGPU_BeginRenderPass(SDL_GPUCommandBuffer *commandBuffer, const SD
     desc.label = (WGPUStringView){ NULL, WGPU_STRLEN };
 
     wrapper->renderPassEncoder = wgpuCommandEncoderBeginRenderPass(wrapper->encoder, &desc);
+    // WebGPU starts each pass with a blend constant of (0, 0, 0, 0); the other SDL backends start with (1, 1, 1, 1).
+    wgpuRenderPassEncoderSetBlendConstant(wrapper->renderPassEncoder, &(WGPUColor){ 1.0, 1.0, 1.0, 1.0 });
     wrapper->boundGraphicsPipeline = NULL;
     wrapper->hasBoundGraphicsPipeline = false;
 }
