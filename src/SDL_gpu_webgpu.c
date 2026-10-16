@@ -3760,11 +3760,13 @@ static SDL_GPUGraphicsPipeline *WEBGPU_CreateGraphicsPipeline(SDL_GPURenderer *d
     WebGPUShader *vertexShader = (WebGPUShader *)createInfo->vertex_shader;
     WebGPUShader *fragmentShader = (WebGPUShader *)createInfo->fragment_shader;
 
+    // WebGPU rejects a non-zero depth bias on point and line topologies, which the native backends accept.
+    bool isTriangleTopology = createInfo->primitive_type == SDL_GPU_PRIMITIVETYPE_TRIANGLELIST || createInfo->primitive_type == SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP;
+    bool depthBiasEnabled = createInfo->rasterizer_state.enable_depth_bias && isTriangleTopology;
     WGPUDepthStencilState depthStencilState = {
-        // yucky wucky
-        .depthBias = (Uint32)createInfo->rasterizer_state.depth_bias_constant_factor,
-        .depthBiasClamp = createInfo->rasterizer_state.depth_bias_clamp,
-        .depthBiasSlopeScale = createInfo->rasterizer_state.depth_bias_slope_factor,
+        .depthBias = depthBiasEnabled ? (Sint32)SDL_lroundf(createInfo->rasterizer_state.depth_bias_constant_factor) : 0,
+        .depthBiasClamp = depthBiasEnabled ? createInfo->rasterizer_state.depth_bias_clamp : 0.0f,
+        .depthBiasSlopeScale = depthBiasEnabled ? createInfo->rasterizer_state.depth_bias_slope_factor : 0.0f,
         .depthCompare = SDLToWebGPU_CompareFunc[createInfo->depth_stencil_state.compare_op],
         .depthWriteEnabled = createInfo->depth_stencil_state.enable_depth_write,
         .stencilBack = createInfo->depth_stencil_state.enable_stencil_test ? (WGPUStencilFaceState){
@@ -4926,6 +4928,8 @@ static void WEBGPU_BeginRenderPass(SDL_GPUCommandBuffer *commandBuffer, const SD
     desc.label = (WGPUStringView){ NULL, WGPU_STRLEN };
 
     wrapper->renderPassEncoder = wgpuCommandEncoderBeginRenderPass(wrapper->encoder, &desc);
+    // WebGPU starts each pass with a blend constant of (0, 0, 0, 0); the other SDL backends start with (1, 1, 1, 1).
+    wgpuRenderPassEncoderSetBlendConstant(wrapper->renderPassEncoder, &(WGPUColor){ 1.0, 1.0, 1.0, 1.0 });
     wrapper->boundGraphicsPipeline = NULL;
     wrapper->hasBoundGraphicsPipeline = false;
 }
@@ -5000,7 +5004,7 @@ static void WEBGPU_PushComputeUniformData(SDL_GPUCommandBuffer *commandBuffer, U
 
 static void WEBGPU_SetBlendConstants(SDL_GPUCommandBuffer *commandBuffer, SDL_FColor blendConstants)
 {
-    wgpuRenderPassEncoderSetBlendConstant(((WebGPUCommandBuffer *)commandBuffer)->renderPassEncoder, &(WGPUColor){ blendConstants.a, blendConstants.r, blendConstants.g, blendConstants.b });
+    wgpuRenderPassEncoderSetBlendConstant(((WebGPUCommandBuffer *)commandBuffer)->renderPassEncoder, &(WGPUColor){ blendConstants.r, blendConstants.g, blendConstants.b, blendConstants.a });
 }
 
 // Native backends accept rects that hang over the render area; WebGPU does not, so clamp to keep them equivalent.
