@@ -287,6 +287,21 @@ static bool CountFrameAllocations(SDL_GPUDevice *device, int *out_count)
     return success;
 }
 
+// Source of the copies and the blit in every presented frame. Copies need the swapchain format, so a change of composition needs a new source.
+static SDL_GPUTexture *CreateFrameSource(SDL_GPUDevice *device, SDL_GPUTextureFormat format)
+{
+    SDL_GPUTextureCreateInfo info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = format,
+        .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = 1,
+        .height = 1,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    };
+    return SDL_CreateGPUTexture(device, &info);
+}
+
 static bool PixelsAreUniform(const Uint8 *pixels, Uint32 count, Uint32 bytes_per_pixel)
 {
     for (Uint32 i = 1; i < count; i++) {
@@ -424,17 +439,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
         return SDL_APP_FAILURE;
     }
 
-    // Source of the copies and the blit in every presented frame.
-    SDL_GPUTextureCreateInfo frame_source_info = {
-        .type = SDL_GPU_TEXTURETYPE_2D,
-        .format = SDL_GetGPUSwapchainTextureFormat(state->device, state->window),
-        .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
-        .width = 1,
-        .height = 1,
-        .layer_count_or_depth = 1,
-        .num_levels = 1,
-    };
-    state->frame_source = SDL_CreateGPUTexture(state->device, &frame_source_info);
+    state->frame_source = CreateFrameSource(state->device, SDL_GetGPUSwapchainTextureFormat(state->device, state->window));
     if (!state->frame_source) {
         SDL_Log("SDL_CreateGPUTexture for the frame source failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
@@ -449,6 +454,32 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
 SDL_AppResult SDL_AppIterate(void *appstate)
 {
     AppState *state = appstate;
+
+    // Halfway through warm-up, switch to SDR_LINEAR. A canvas has no sRGB format, so the backend renders through an sRGB view.
+    // Asking whether a composition is supported must not change the current swapchain format.
+    if (state->frames_submitted == WARM_UP_FRAMES / 2) {
+        SDL_GPUTextureFormat sdr_format = SDL_GetGPUSwapchainTextureFormat(state->device, state->window);
+        bool supported = SDL_WindowSupportsGPUSwapchainComposition(state->device, state->window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR);
+        if (!supported || SDL_GetGPUSwapchainTextureFormat(state->device, state->window) != sdr_format) {
+            SDL_Log("SDR_LINEAR query failed: supported %s, format %d before and %d after", supported ? "yes" : "no", sdr_format, SDL_GetGPUSwapchainTextureFormat(state->device, state->window));
+            return SDL_APP_FAILURE;
+        }
+        if (!SDL_SetGPUSwapchainParameters(state->device, state->window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR, SDL_GPU_PRESENTMODE_VSYNC)) {
+            SDL_Log("SDL_SetGPUSwapchainParameters(SDR_LINEAR) failed: %s", SDL_GetError());
+            return SDL_APP_FAILURE;
+        }
+        SDL_GPUTextureFormat linear_format = SDL_GetGPUSwapchainTextureFormat(state->device, state->window);
+        SDL_Log("SDR_LINEAR swapchain format: %d (sRGB: %s)", linear_format, linear_format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB || linear_format == SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB ? "yes" : "no");
+        if (linear_format != SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB && linear_format != SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB) {
+            return SDL_APP_FAILURE;
+        }
+        SDL_ReleaseGPUTexture(state->device, state->frame_source);
+        state->frame_source = CreateFrameSource(state->device, linear_format);
+        if (!state->frame_source) {
+            SDL_Log("SDL_CreateGPUTexture for the SDR_LINEAR frame source failed: %s", SDL_GetError());
+            return SDL_APP_FAILURE;
+        }
+    }
 
     allocation_count = 0;
     counting_allocations = state->frames_submitted >= WARM_UP_FRAMES;

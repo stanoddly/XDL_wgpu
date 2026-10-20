@@ -906,6 +906,8 @@ struct WebGPUWindowData
 
     WGPUSurface surface;
     WGPUSurfaceConfiguration surfaceConfig;
+    // The sRGB view format of an SDR_LINEAR surface configured with a UNORM format, which surfaceConfig.viewFormats points to.
+    WGPUTextureFormat viewFormat;
 };
 
 typedef enum WebGPUBufferType
@@ -3256,7 +3258,8 @@ static WGPUBindGroup WEBGPU_INTERNAL_GetBindGroup(WebGPUCommandBuffer *cmdBuf, W
 // Gives view a new WebGPU view of texture and a new identifier.
 static void WEBGPU_INTERNAL_InitTextureView(WebGPURenderer *renderer, WebGPUTexture *texture, int depth, int mipLevel, WebGPUTextureView *view)
 {
-    WGPUTextureFormat format = wgpuTextureGetFormat(texture->texture);
+    // Not wgpuTextureGetFormat: an SDR_LINEAR swapchain texture has a UNORM format and is viewed as sRGB.
+    WGPUTextureFormat format = SDLToWebGPU_TextureFormat[texture->format];
     WGPUTextureUsage usages = wgpuTextureGetUsage(texture->texture);
     WGPUTextureViewDimension dimension = WGPUTextureViewDimension_Undefined;
 
@@ -3499,9 +3502,44 @@ static void WEBGPU_ReleaseSampler(SDL_GPURenderer *device, SDL_GPUSampler *sampl
     WEBGPU_INTERNAL_QueueSamplerForRelease((WebGPURenderer *)device, (WebGPUSampler *)sampler);
 }
 
-// forward decl
-static bool WEBGPU_SupportsSwapchainComposition(SDL_GPURenderer *driverData, SDL_Window *window, SDL_GPUSwapchainComposition swapchainComposition);
-static SDL_GPUTextureFormat WEBGPU_GetSwapchainTextureFormat(SDL_GPURenderer *device, SDL_Window *window);
+// Picks the first surface format that can present the composition, without changing the window's state.
+// A canvas cannot be configured with an sRGB format, so SDR_LINEAR may use the matching UNORM format and render through an sRGB view.
+// Such a view needs core-features-and-limits, which an adopted compatibility-mode device lacks.
+static bool WEBGPU_INTERNAL_FindSwapchainFormat(WebGPUWindowData *windowData, SDL_GPUSwapchainComposition composition, WGPUTextureFormat *surfaceFormat, WGPUTextureFormat *viewFormat, bool *usingFallback)
+{
+    WGPUSurfaceCapabilities caps = { 0 };
+    bool found = false;
+
+    if (windowData == NULL) {
+        SDL_LogError(SDL_LOG_CATEGORY_GPU, "WindowData pointer is NULL!");
+        SDL_SetError("WindowData pointer is NULL! Did you call SDL_ClaimWindowForGPUDevice?");
+        return false;
+    }
+
+    bool srgbViewAllowed = composition == SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR && wgpuDeviceHasFeature(windowData->renderer->device, WGPUFeatureName_CoreFeaturesAndLimits);
+
+    if (wgpuSurfaceGetCapabilities(windowData->surface, windowData->renderer->adapter, &caps) == WGPUStatus_Error) {
+        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to get surface capabilities!");
+        SDL_SetError("Failed to get surface capabilities!");
+        return false;
+    }
+
+    for (size_t i = 0; i < caps.formatCount && !found; i++) {
+        WGPUTextureFormat format = caps.formats[i];
+        bool throughSrgbView = srgbViewAllowed && (format == WGPUTextureFormat_RGBA8Unorm || format == WGPUTextureFormat_BGRA8Unorm);
+
+        if (format == SwapchainCompositionToFormat[composition] || format == SwapchainCompositionToFallbackFormat[composition] || throughSrgbView) {
+            found = true;
+            *surfaceFormat = format;
+            *viewFormat = !throughSrgbView ? WGPUTextureFormat_Undefined : format == WGPUTextureFormat_RGBA8Unorm ? WGPUTextureFormat_RGBA8UnormSrgb : WGPUTextureFormat_BGRA8UnormSrgb;
+            // Only the SDR compositions have a fallback, and it is the BGRA variant.
+            *usingFallback = format == WGPUTextureFormat_BGRA8Unorm || format == WGPUTextureFormat_BGRA8UnormSrgb;
+        }
+    }
+
+    wgpuSurfaceCapabilitiesFreeMembers(caps);
+    return found;
+}
 static void WEBGPU_ReleaseWindow(SDL_GPURenderer *driverData, SDL_Window *window);
 
 // Cleanup of the window property, so it runs both when the claim is released and when SDL_DestroyWindow destroys a window
@@ -3568,7 +3606,9 @@ static bool WEBGPU_ClaimWindow(SDL_GPURenderer *device, SDL_Window *window)
     int w = 0;
     int h = 0;
 
-    if (!WEBGPU_SupportsSwapchainComposition(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR)) {
+    WGPUTextureFormat surfaceFormat = WGPUTextureFormat_Undefined;
+    WGPUTextureFormat viewFormat = WGPUTextureFormat_Undefined;
+    if (!WEBGPU_INTERNAL_FindSwapchainFormat(windowData, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, &surfaceFormat, &viewFormat, &windowData->shouldUseFallbackFormat)) {
         SDL_assert_release(!"Surface does not support SDR!");
     }
 
@@ -3579,7 +3619,7 @@ static bool WEBGPU_ClaimWindow(SDL_GPURenderer *device, SDL_Window *window)
     windowData->surfaceConfig = (WGPUSurfaceConfiguration){
         .device = windowData->renderer->device,
         .usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst,
-        .format = SDLToWebGPU_TextureFormat[WEBGPU_GetSwapchainTextureFormat(device, window)],
+        .format = surfaceFormat,
         .presentMode = WGPUPresentMode_Fifo,
         .alphaMode = WGPUCompositeAlphaMode_Auto,
         .width = w,
@@ -5945,39 +5985,11 @@ static SDL_GPUTextureFormat WEBGPU_GetSwapchainTextureFormat(SDL_GPURenderer *de
 static bool WEBGPU_SupportsSwapchainComposition(SDL_GPURenderer *driverData, SDL_Window *window, SDL_GPUSwapchainComposition swapchainComposition)
 {
     WebGPUWindowData *windowData = SDL_GetPointerProperty(SDL_GetWindowProperties(window), WINDOW_PROPERTY_DATA, NULL);
-    WGPUSurfaceCapabilities caps = { 0 };
-    bool supportsComposition = false;
+    WGPUTextureFormat surfaceFormat;
+    WGPUTextureFormat viewFormat;
+    bool usingFallback;
 
-    if (windowData == NULL) {
-        SDL_LogError(SDL_LOG_CATEGORY_GPU, "WindowData pointer is NULL!");
-        SDL_SetError("WindowData pointer is NULL! Did you call SDL_ClaimWindowForGPUDevice?");
-        return false;
-    }
-
-    WGPUStatus getCapsStatus = wgpuSurfaceGetCapabilities(windowData->surface, windowData->renderer->adapter, &caps);
-
-    if (getCapsStatus == WGPUStatus_Error) {
-        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Failed to get surface capabilities!");
-        SDL_SetError("Failed to get surface capabilities!");
-        return false;
-    }
-
-    for (int i = 0; i < caps.formatCount; i++) {
-        if (caps.formats[i] == SwapchainCompositionToFormat[swapchainComposition]) {
-            supportsComposition = true;
-            windowData->shouldUseFallbackFormat = false;
-
-            break;
-        } else if (caps.formats[i] == SwapchainCompositionToFallbackFormat[swapchainComposition]) {
-            supportsComposition = true;
-            windowData->shouldUseFallbackFormat = true;
-
-            break;
-        }
-    }
-
-    wgpuSurfaceCapabilitiesFreeMembers(caps);
-    return supportsComposition;
+    return WEBGPU_INTERNAL_FindSwapchainFormat(windowData, swapchainComposition, &surfaceFormat, &viewFormat, &usingFallback);
 }
 
 static bool WEBGPU_SupportsPresentMode(SDL_GPURenderer *driverData, SDL_Window *window, SDL_GPUPresentMode presentMode)
@@ -6018,8 +6030,11 @@ static bool WEBGPU_SetSwapchainParameters(SDL_GPURenderer *driverData, SDL_Windo
                                           SDL_GPUSwapchainComposition swapchainComposition, SDL_GPUPresentMode presentMode)
 {
     WebGPUWindowData *windowData = SDL_GetPointerProperty(SDL_GetWindowProperties(window), WINDOW_PROPERTY_DATA, NULL);
+    WGPUTextureFormat surfaceFormat;
+    WGPUTextureFormat viewFormat;
+    bool usingFallback;
 
-    if (!WEBGPU_SupportsSwapchainComposition(driverData, window, swapchainComposition)) {
+    if (!WEBGPU_INTERNAL_FindSwapchainFormat(windowData, swapchainComposition, &surfaceFormat, &viewFormat, &usingFallback)) {
         SDL_SetError("Window does not support swapchainComposition!");
         return false;
     }
@@ -6029,7 +6044,11 @@ static bool WEBGPU_SetSwapchainParameters(SDL_GPURenderer *driverData, SDL_Windo
         return false;
     }
 
-    windowData->surfaceConfig.format = windowData->shouldUseFallbackFormat ? SwapchainCompositionToFallbackFormat[swapchainComposition] : SwapchainCompositionToFormat[swapchainComposition];
+    windowData->shouldUseFallbackFormat = usingFallback;
+    windowData->viewFormat = viewFormat;
+    windowData->surfaceConfig.format = surfaceFormat;
+    windowData->surfaceConfig.viewFormatCount = viewFormat == WGPUTextureFormat_Undefined ? 0 : 1;
+    windowData->surfaceConfig.viewFormats = &windowData->viewFormat;
     windowData->surfaceConfig.presentMode = SDLToWebGPU_PresentMode[presentMode];
     windowData->surfaceConfig.device = windowData->renderer->device;
 
