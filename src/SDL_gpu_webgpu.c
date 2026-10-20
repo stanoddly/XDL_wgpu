@@ -51,10 +51,9 @@
 
 extern WGPUSurface XDL_WGPU_CreateSurface(SDL_Window *window, WGPUInstance instance);
 
-#define WINDOW_PROPERTY_DATA                           "SDL.internal.gpu.webgpu.data"
-#define DEFAULT_BINDGROUP_EXPIRY                       10000
-#define FORCIBLY_DESTROY_QUEUED_DESTROY_AFTER_N_FAILED 10000
-#define DESTROY_DEVICE_DRAIN_TIMEOUT_NS                SDL_NS_PER_SECOND
+#define WINDOW_PROPERTY_DATA            "SDL.internal.gpu.webgpu.data"
+#define DEFAULT_BINDGROUP_EXPIRY        10000
+#define DESTROY_DEVICE_DRAIN_TIMEOUT_NS SDL_NS_PER_SECOND
 
 // Disable pseudo-mapping. Useful for debugging upload errors.
 #define DEV_DISABLE_TRANSFER_BUFFER_PSEUDO_MAPPING false
@@ -2879,22 +2878,13 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
             WebGPUQueuedDestroy current = renderer->queuedDestroys[i];
 
             int currentRefCount = 0;
-            bool forciblyDestroy = forceAll;
             bool wasReleased = false;
 
-            // While the device is being destroyed, WEBGPU_DestroyDevice forces releases itself, and only after abandoning the
-            // submissions that still reference resources. Its drain loop runs passes far faster than frames, so the attempt
-            // count would otherwise free a resource an in-flight submission uses, and releasing that submission later would
-            // touch freed memory.
-            if (!renderer->destroyingSelf) {
-                if (current.destroysAttempted >= 100 && current.destroysAttempted % 100 == 0) {
-                    SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Queued destroy has been attempted %i times!", current.destroysAttempted);
-                }
-
-                if (current.destroysAttempted >= FORCIBLY_DESTROY_QUEUED_DESTROY_AFTER_N_FAILED) {
-                    SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Queued destroy has been attempted %i times! Forcibly destroying.", current.destroysAttempted);
-                    forciblyDestroy = true;
-                }
+            // A resource stays referenced while a command buffer records with it or its submission runs, however long that takes,
+            // so it is never freed early. Only a device being destroyed forces it, after abandoning those submissions.
+            // The drain loop in WEBGPU_DestroyDevice runs passes far faster than frames, so it would flood this warning.
+            if (!renderer->destroyingSelf && current.destroysAttempted >= 100 && current.destroysAttempted % 100 == 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Queued destroy has been attempted %i times!", current.destroysAttempted);
             }
 
             switch (current.type) {
@@ -2908,21 +2898,21 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
                     currentRefCount += refCount;
                 }
 
-                if (currentRefCount == 0 || forciblyDestroy) {
+                if (currentRefCount == 0 || forceAll) {
                     WEBGPU_INTERNAL_ReleaseTextureContainer(renderer, current.resource.textureContainer);
                     wasReleased = true;
                 }
                 break;
             case WEBGPU_QUEUED_DESTROY_TEXTURE:
                 currentRefCount = SDL_GetAtomicInt(&current.resource.texture->referenceCount);
-                if (currentRefCount == 0 || forciblyDestroy) {
+                if (currentRefCount == 0 || forceAll) {
                     WEBGPU_INTERNAL_ReleaseTexture(renderer, current.resource.texture);
                     wasReleased = true;
                 }
                 break;
             case WEBGPU_QUEUED_DESTROY_SAMPLER:
                 currentRefCount = current.resource.sampler->numDependants;
-                if (currentRefCount == 0 || forciblyDestroy) {
+                if (currentRefCount == 0 || forceAll) {
                     WEBGPU_INTERNAL_ReleaseSampler(renderer, current.resource.sampler);
                     wasReleased = true;
                 }
@@ -2933,14 +2923,14 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
                     int refCount = SDL_GetAtomicInt(&current.resource.bufferContainer->buffers[j]->referenceCount);
                     currentRefCount += refCount;
                 }
-                if (currentRefCount == 0 || forciblyDestroy) {
+                if (currentRefCount == 0 || forceAll) {
                     WEBGPU_INTERNAL_ReleaseBufferContainer(renderer, current.resource.bufferContainer);
                     wasReleased = true;
                 }
                 break;
             case WEBGPU_QUEUED_DESTROY_BUFFER:
                 currentRefCount = SDL_GetAtomicInt(&current.resource.buffer->referenceCount);
-                if (currentRefCount == 0 || forciblyDestroy) {
+                if (currentRefCount == 0 || forceAll) {
                     WEBGPU_INTERNAL_ReleaseBuffer(renderer, current.resource.buffer);
                     wasReleased = true;
                 }
@@ -2953,14 +2943,14 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
                 break;
             case WEBGPU_QUEUED_DESTROY_GRAPHICS_PIPELINE:
                 currentRefCount = SDL_GetAtomicInt(&current.resource.graphicsPipeline->referenceCount);
-                if (currentRefCount == 0 || forciblyDestroy) {
+                if (currentRefCount == 0 || forceAll) {
                     WEBGPU_INTERNAL_ReleaseGraphicsPipeline(current.resource.graphicsPipeline);
                     wasReleased = true;
                 }
                 break;
             case WEBGPU_QUEUED_DESTROY_COMPUTE_PIPELINE:
                 currentRefCount = SDL_GetAtomicInt(&current.resource.computePipeline->referenceCount);
-                if (currentRefCount == 0 || forciblyDestroy) {
+                if (currentRefCount == 0 || forceAll) {
                     WEBGPU_INTERNAL_ReleaseComputePipeline(current.resource.computePipeline);
                     wasReleased = true;
                 }
