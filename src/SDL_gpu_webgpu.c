@@ -3811,6 +3811,8 @@ static void WEBGPU_INTERNAL_ReleaseShader(WebGPUShader *shader)
     }
 
     wgpuShaderModuleRelease(shader->shader);
+    wgpuBindGroupLayoutRelease(shader->bindGroupLayouts->samplerStorageBindGroupLayout);
+    wgpuBindGroupLayoutRelease(shader->bindGroupLayouts->uniformBindGroupLayout);
 
     SDL_free(shader->bindGroupLayouts);
     SDL_free(shader->entrypoint);
@@ -3999,9 +4001,13 @@ static SDL_GPUGraphicsPipeline *WEBGPU_CreateGraphicsPipeline(SDL_GPURenderer *d
 
     pipeline = SDL_calloc(1, sizeof(WebGPUGraphicsPipeline));
     pipeline->pipeline = wgpuDeviceCreateRenderPipeline(((WebGPURenderer *)driverData)->device, &pipelineDesc);
+    wgpuPipelineLayoutRelease(pipelineLayout);
 
     pipeline->vertexBindGroupLayouts = *vertexShader->bindGroupLayouts;
     pipeline->fragmentBindGroupLayouts = *fragmentShader->bindGroupLayouts;
+    for (int i = 0; i < 4; i++) {
+        wgpuBindGroupLayoutAddRef(bindGroupLayouts[i]);
+    }
 
     for (int i = 0; i < createInfo->vertex_input_state.num_vertex_buffers; i++) {
         SDL_free((void *)vertexBufferLayouts[i].attributes);
@@ -4022,6 +4028,10 @@ static void WEBGPU_ReleaseGraphicsPipeline(SDL_GPURenderer *device, SDL_GPUGraph
     WebGPUGraphicsPipeline *pipeline = (WebGPUGraphicsPipeline *)_pipeline;
 
     wgpuRenderPipelineRelease(pipeline->pipeline);
+    wgpuBindGroupLayoutRelease(pipeline->vertexBindGroupLayouts.samplerStorageBindGroupLayout);
+    wgpuBindGroupLayoutRelease(pipeline->vertexBindGroupLayouts.uniformBindGroupLayout);
+    wgpuBindGroupLayoutRelease(pipeline->fragmentBindGroupLayouts.samplerStorageBindGroupLayout);
+    wgpuBindGroupLayoutRelease(pipeline->fragmentBindGroupLayouts.uniformBindGroupLayout);
     SDL_free(pipeline);
 }
 
@@ -5506,6 +5516,7 @@ static SDL_GPUComputePipeline *WEBGPU_CreateComputePipeline(SDL_GPURenderer *dev
         wgpuBindGroupLayoutRelease(pipeline->bindGroupLayouts->uniformBindGroupLayout);
 
         SDL_free(pipelineLayoutEntries);
+        SDL_free(pipeline->bindGroupLayouts);
         SDL_free(pipeline);
 
         return NULL;
@@ -5523,6 +5534,7 @@ static SDL_GPUComputePipeline *WEBGPU_CreateComputePipeline(SDL_GPURenderer *dev
     pipelineDesc.nextInChain = NULL;
 
     pipeline->pipeline = wgpuDeviceCreateComputePipeline(((WebGPURenderer *)device)->device, &pipelineDesc);
+    wgpuPipelineLayoutRelease(pipelineLayout);
 
     SDL_free(pipelineLayoutEntries);
 
@@ -5532,6 +5544,7 @@ static SDL_GPUComputePipeline *WEBGPU_CreateComputePipeline(SDL_GPURenderer *dev
         wgpuBindGroupLayoutRelease(pipeline->bindGroupLayouts->samplerStorageBindGroupLayout);
         wgpuBindGroupLayoutRelease(pipeline->bindGroupLayouts->readWriteStorageBindGroupLayout);
         wgpuBindGroupLayoutRelease(pipeline->bindGroupLayouts->uniformBindGroupLayout);
+        SDL_free(pipeline->bindGroupLayouts);
         SDL_free(pipeline);
 
         return NULL;
@@ -6202,6 +6215,7 @@ static void WEBGPU_INTERNAL_InitUniformBuffers(WebGPURenderer *renderer)
         desc.entryCount = 4;
 
         renderer->uniformBufferBindGroups[i] = wgpuDeviceCreateBindGroup(renderer->device, &desc);
+        wgpuBindGroupLayoutRelease(layout);
         SDL_free(layoutEntries);
         SDL_free(entries);
     }
