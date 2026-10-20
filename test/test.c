@@ -80,6 +80,11 @@ static int CountLiveLayouts(void)
     return EM_ASM_INT({ return Object.values(WebGPU.Internals.jsObjects).filter(o => o instanceof GPUBindGroupLayout || o instanceof GPUPipelineLayout).length; });
 }
 
+static int CountLivePipelines(void)
+{
+    return EM_ASM_INT({ return Object.values(WebGPU.Internals.jsObjects).filter(o => o instanceof GPURenderPipeline || o instanceof GPUComputePipeline).length; });
+}
+
 static Uint32 BytesPerPixel(SDL_GPUTextureFormat format)
 {
     return format == SDL_GPU_TEXTUREFORMAT_R8_UNORM ? 1 : 4;
@@ -484,23 +489,23 @@ static bool PixelsAreUniform(const Uint8 *pixels, Uint32 count, Uint32 bytes_per
     return true;
 }
 
-// Creates a graphics and a compute pipeline, counts the live layouts while both exist, then releases them.
-static bool CreateAndReleasePipelines(SDL_GPUDevice *device, int *out_live_layouts)
+#define ORIGIN_VERTEX_CODE \
+    "@vertex fn main() -> @builtin(position) vec4f {\n" \
+    "    return vec4f(0.0);\n" \
+    "}\n"
+
+// Writes to the read-write storage buffer in slot 0.
+static SDL_GPUComputePipeline *CreateComputePipeline(SDL_GPUDevice *device)
 {
-    static const char vertex_code[] =
-        "@vertex fn main() -> @builtin(position) vec4f {\n"
-        "    return vec4f(0.0);\n"
-        "}\n";
-    static const char compute_code[] =
+    static const char code[] =
         "@group(1) @binding(0) var<storage, read_write> values: array<u32>;\n"
         "@compute @workgroup_size(1) fn main() {\n"
         "    values[0] = 1u;\n"
         "}\n";
 
-    SDL_GPUGraphicsPipeline *graphics_pipeline = CreatePipeline(device, vertex_code, 0, SAMPLING_FRAGMENT_CODE);
-    SDL_GPUComputePipelineCreateInfo compute_info = {
-        .code = (const Uint8 *)compute_code,
-        .code_size = sizeof(compute_code) - 1,
+    SDL_GPUComputePipelineCreateInfo info = {
+        .code = (const Uint8 *)code,
+        .code_size = sizeof(code) - 1,
         .entrypoint = "main",
         .format = SDL_GPU_SHADERFORMAT_WGSL,
         .num_readwrite_storage_buffers = 1,
@@ -508,13 +513,75 @@ static bool CreateAndReleasePipelines(SDL_GPUDevice *device, int *out_live_layou
         .threadcount_y = 1,
         .threadcount_z = 1,
     };
-    SDL_GPUComputePipeline *compute_pipeline = SDL_CreateGPUComputePipeline(device, &compute_info);
+    return SDL_CreateGPUComputePipeline(device, &info);
+}
+
+// Creates a graphics and a compute pipeline, counts the live layouts while both exist, then releases them.
+static bool CreateAndReleasePipelines(SDL_GPUDevice *device, int *out_live_layouts)
+{
+    SDL_GPUGraphicsPipeline *graphics_pipeline = CreatePipeline(device, ORIGIN_VERTEX_CODE, 0, SAMPLING_FRAGMENT_CODE);
+    SDL_GPUComputePipeline *compute_pipeline = CreateComputePipeline(device);
     if (!graphics_pipeline || !compute_pipeline) {
         return SDL_SetError("Creating the pipelines failed: %s", SDL_GetError());
     }
     *out_live_layouts = CountLiveLayouts();
     SDL_ReleaseGPUGraphicsPipeline(device, graphics_pipeline);
     SDL_ReleaseGPUComputePipeline(device, compute_pipeline);
+    // Released pipelines are destroyed once no command buffer uses them, which the wait checks for.
+    SDL_WaitForGPUIdle(device);
+    return true;
+}
+
+// Releases a graphics and a compute pipeline while they are bound in a recording command buffer, then binds and uses them.
+// Counts the live pipelines before the release, after the release while recording, and after the submission completes.
+static bool UseReleasedPipelines(SDL_GPUDevice *device, int out_live_pipelines[3])
+{
+    SDL_GPUGraphicsPipeline *graphics_pipeline = CreatePipeline(device, ORIGIN_VERTEX_CODE, 0, SAMPLING_FRAGMENT_CODE);
+    SDL_GPUComputePipeline *compute_pipeline = CreateComputePipeline(device);
+    SDL_GPUTextureCreateInfo texture_info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+        .width = 4,
+        .height = 4,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    };
+    SDL_GPUTexture *source = SDL_CreateGPUTexture(device, &texture_info);
+    SDL_GPUTexture *target = SDL_CreateGPUTexture(device, &texture_info);
+    SDL_GPUSampler *sampler = SDL_CreateGPUSampler(device, &(SDL_GPUSamplerCreateInfo){ 0 });
+    SDL_GPUBuffer *buffer = SDL_CreateGPUBuffer(device, &(SDL_GPUBufferCreateInfo){ .usage = SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE, .size = 4 });
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(device);
+    if (!graphics_pipeline || !compute_pipeline || !source || !target || !sampler || !buffer || !cmd) {
+        return SDL_SetError("Creating the resources failed: %s", SDL_GetError());
+    }
+    out_live_pipelines[0] = CountLivePipelines();
+
+    SDL_GPUColorTargetInfo color_target = { .texture = target, .load_op = SDL_GPU_LOADOP_CLEAR, .store_op = SDL_GPU_STOREOP_STORE };
+    SDL_GPURenderPass *render_pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL);
+    SDL_BindGPUGraphicsPipeline(render_pass, graphics_pipeline);
+    SDL_ReleaseGPUGraphicsPipeline(device, graphics_pipeline);
+    SDL_BindGPUFragmentSamplers(render_pass, 0, &(SDL_GPUTextureSamplerBinding){ .texture = source, .sampler = sampler }, 1);
+    SDL_DrawGPUPrimitives(render_pass, 3, 1, 0, 0);
+    SDL_EndGPURenderPass(render_pass);
+
+    SDL_GPUComputePass *compute_pass = SDL_BeginGPUComputePass(cmd, NULL, 0, &(SDL_GPUStorageBufferReadWriteBinding){ .buffer = buffer }, 1);
+    SDL_BindGPUComputePipeline(compute_pass, compute_pipeline);
+    SDL_ReleaseGPUComputePipeline(device, compute_pipeline);
+    SDL_DispatchGPUCompute(compute_pass, 1, 1, 1);
+    SDL_EndGPUComputePass(compute_pass);
+    out_live_pipelines[1] = CountLivePipelines();
+
+    if (!SDL_SubmitGPUCommandBuffer(cmd)) {
+        return SDL_SetError("SDL_SubmitGPUCommandBuffer: %s", SDL_GetError());
+    }
+    SDL_WaitForGPUIdle(device);
+    out_live_pipelines[2] = CountLivePipelines();
+
+    SDL_ReleaseGPUBuffer(device, buffer);
+    SDL_ReleaseGPUSampler(device, sampler);
+    SDL_ReleaseGPUTexture(device, target);
+    SDL_ReleaseGPUTexture(device, source);
     return true;
 }
 
@@ -697,6 +764,17 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
     int layouts_after_pipelines = CountLiveLayouts();
     SDL_Log("Live layouts: %d before creating pipelines, %d while they exist, %d after releasing them", layouts_before_pipelines, layouts_with_pipelines, layouts_after_pipelines);
     if (layouts_with_pipelines != layouts_before_pipelines + 7 || layouts_after_pipelines != layouts_before_pipelines) {
+        return SDL_APP_FAILURE;
+    }
+
+    // A released pipeline stays alive while a command buffer that bound it records or runs.
+    int live_pipelines[3] = { 0 };
+    if (!UseReleasedPipelines(state->device, live_pipelines)) {
+        SDL_Log("Using released pipelines failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    SDL_Log("Live pipelines: %d before releasing two bound pipelines, %d while recording, %d after the submission", live_pipelines[0], live_pipelines[1], live_pipelines[2]);
+    if (live_pipelines[1] != live_pipelines[0] || live_pipelines[2] != live_pipelines[0] - 2) {
         return SDL_APP_FAILURE;
     }
 

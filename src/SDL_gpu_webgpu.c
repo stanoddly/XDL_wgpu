@@ -790,6 +790,8 @@ typedef struct WebGPUFence WebGPUFence;
 typedef struct WebGPUSubmittedCommandBuffer WebGPUSubmittedCommandBuffer;
 typedef struct WebGPUCommandBuffer WebGPUCommandBuffer;
 typedef struct WebGPUQueuedDestroy WebGPUQueuedDestroy;
+typedef struct WebGPUGraphicsPipeline WebGPUGraphicsPipeline;
+typedef struct WebGPUComputePipeline WebGPUComputePipeline;
 
 // The blit fragment shaders and the pipelines built from them, for one kind of source texture binding.
 typedef struct WebGPUBlitFragmentShaders
@@ -957,6 +959,8 @@ typedef enum WebGPUQueuedDestroyType
     WEBGPU_QUEUED_DESTROY_BUFFER_CONTAINER,
     WEBGPU_QUEUED_DESTROY_BUFFER,
     WEBGPU_QUEUED_DESTROY_BIND_GROUP,
+    WEBGPU_QUEUED_DESTROY_GRAPHICS_PIPELINE,
+    WEBGPU_QUEUED_DESTROY_COMPUTE_PIPELINE,
 } WebGPUQueuedDestroyType;
 
 typedef struct WebGPUBindGroupCacheKey
@@ -1264,6 +1268,9 @@ typedef struct WebGPUQueuedDestroy
         WebGPUBuffer *buffer;
 
         WebGPUBindGroup *bindGroup;
+
+        WebGPUGraphicsPipeline *graphicsPipeline;
+        WebGPUComputePipeline *computePipeline;
     } resource;
 
     // Just used for debugging. If this is above 100 it'll log to the console that this resource is very stubborn.
@@ -1300,7 +1307,7 @@ typedef struct WebGPUShader
     Uint32 refCount;
 } WebGPUShader;
 
-typedef struct WebGPUGraphicsPipeline
+struct WebGPUGraphicsPipeline
 {
     GraphicsPipelineCommonHeader header;
 
@@ -1308,9 +1315,12 @@ typedef struct WebGPUGraphicsPipeline
 
     WebGPUShaderBindGroupLayouts vertexBindGroupLayouts;
     WebGPUShaderBindGroupLayouts fragmentBindGroupLayouts;
-} WebGPUGraphicsPipeline;
 
-typedef struct WebGPUComputePipeline
+    // One reference for each bind in a command buffer that is recording or whose submission has not completed.
+    SDL_AtomicInt referenceCount;
+};
+
+struct WebGPUComputePipeline
 {
     ComputePipelineCommonHeader header;
     WGPUShaderModule computeShader;
@@ -1318,7 +1328,9 @@ typedef struct WebGPUComputePipeline
 
     WebGPUComputeShaderBindGroupLayouts *bindGroupLayouts;
 
-} WebGPUComputePipeline;
+    // One reference for each bind in a command buffer that is recording or whose submission has not completed.
+    SDL_AtomicInt referenceCount;
+};
 
 typedef struct WebGPUOffsetBufferBinding
 {
@@ -1337,6 +1349,14 @@ struct WebGPUSubmittedCommandBuffer
     WebGPUTexture **usedTextures;
     Uint32 usedTextureCount;
     Uint32 usedTextureCapacity;
+
+    WebGPUGraphicsPipeline **usedGraphicsPipelines;
+    Uint32 usedGraphicsPipelineCount;
+    Uint32 usedGraphicsPipelineCapacity;
+
+    WebGPUComputePipeline **usedComputePipelines;
+    Uint32 usedComputePipelineCount;
+    Uint32 usedComputePipelineCapacity;
 };
 
 struct WebGPUCommandBuffer
@@ -1618,6 +1638,24 @@ static void WEBGPU_INTERNAL_QueueBindGroupForRelease(WebGPURenderer *renderer, W
     }
 
     WEBGPU_INTERNAL_RegisterQueuedDestroy(renderer, (WebGPUQueuedDestroy){ .type = WEBGPU_QUEUED_DESTROY_BIND_GROUP, .resource.bindGroup = bindGroup });
+}
+
+static void WEBGPU_INTERNAL_QueueGraphicsPipelineForRelease(WebGPURenderer *renderer, WebGPUGraphicsPipeline *pipeline)
+{
+    if (pipeline == NULL) {
+        return;
+    }
+
+    WEBGPU_INTERNAL_RegisterQueuedDestroy(renderer, (WebGPUQueuedDestroy){ .type = WEBGPU_QUEUED_DESTROY_GRAPHICS_PIPELINE, .resource.graphicsPipeline = pipeline });
+}
+
+static void WEBGPU_INTERNAL_QueueComputePipelineForRelease(WebGPURenderer *renderer, WebGPUComputePipeline *pipeline)
+{
+    if (pipeline == NULL) {
+        return;
+    }
+
+    WEBGPU_INTERNAL_RegisterQueuedDestroy(renderer, (WebGPUQueuedDestroy){ .type = WEBGPU_QUEUED_DESTROY_COMPUTE_PIPELINE, .resource.computePipeline = pipeline });
 }
 
 // Under Asyncify, emdawnwebgpu keeps a promise for every future until a wgpuInstanceWaitAny with a timeout consumes it.
@@ -1934,6 +1972,8 @@ static void WEBGPU_INTERNAL_FreeCommandBuffer(WebGPUCommandBuffer *cmdBuf)
 {
     SDL_free(cmdBuf->submitted.usedBuffers);
     SDL_free(cmdBuf->submitted.usedTextures);
+    SDL_free(cmdBuf->submitted.usedGraphicsPipelines);
+    SDL_free(cmdBuf->submitted.usedComputePipelines);
     SDL_free(cmdBuf->queuedRepacks);
     SDL_free(cmdBuf->surfaces);
     SDL_free(cmdBuf->acquiredSwapchainTextures);
@@ -1952,6 +1992,10 @@ static void WEBGPU_INTERNAL_ReturnCommandBufferToPool(WebGPURenderer *renderer, 
     cmdBuf->submitted.usedBufferCapacity = recycled.submitted.usedBufferCapacity;
     cmdBuf->submitted.usedTextures = recycled.submitted.usedTextures;
     cmdBuf->submitted.usedTextureCapacity = recycled.submitted.usedTextureCapacity;
+    cmdBuf->submitted.usedGraphicsPipelines = recycled.submitted.usedGraphicsPipelines;
+    cmdBuf->submitted.usedGraphicsPipelineCapacity = recycled.submitted.usedGraphicsPipelineCapacity;
+    cmdBuf->submitted.usedComputePipelines = recycled.submitted.usedComputePipelines;
+    cmdBuf->submitted.usedComputePipelineCapacity = recycled.submitted.usedComputePipelineCapacity;
     cmdBuf->queuedRepacks = recycled.queuedRepacks;
     cmdBuf->queuedRepackCapacity = recycled.queuedRepackCapacity;
     cmdBuf->queuedUniformUploads = recycled.queuedUniformUploads;
@@ -2073,6 +2117,8 @@ static bool WEBGPU_WaitForFences(SDL_GPURenderer *device, bool waitAll, SDL_GPUF
     return WEBGPU_INTERNAL_WaitForFences((WebGPURenderer *)device, waitAll, (WebGPUFence *const *)fences, num_fences);
 }
 
+static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool forceAll);
+
 static bool WEBGPU_Wait(SDL_GPURenderer *driverData)
 {
     WebGPURenderer *renderer = (WebGPURenderer *)driverData;
@@ -2081,6 +2127,8 @@ static bool WEBGPU_Wait(SDL_GPURenderer *driverData)
     for (Uint32 i = 0; i < renderer->submittedCommandBufferCount; i++) {
         WEBGPU_INTERNAL_WaitForFences(renderer, true, &renderer->submittedCommandBuffers[i]->submitted.fence, 1);
     }
+    // Every submission is complete now, so a queued resource that only they used is freed here rather than at the next submit.
+    WEBGPU_INTERNAL_HandlePendingDestroys(renderer, false);
     SDL_UnlockMutex(renderer->submittingCommandBufferLock);
 
     return true;
@@ -2750,8 +2798,18 @@ static void WEBGPU_INTERNAL_ReleaseTrackedResources(WebGPUSubmittedCommandBuffer
         (void)SDL_AtomicDecRef(&submitted->usedTextures[i]->referenceCount);
     }
 
+    for (Uint32 i = 0; i < submitted->usedGraphicsPipelineCount; i++) {
+        (void)SDL_AtomicDecRef(&submitted->usedGraphicsPipelines[i]->referenceCount);
+    }
+
+    for (Uint32 i = 0; i < submitted->usedComputePipelineCount; i++) {
+        (void)SDL_AtomicDecRef(&submitted->usedComputePipelines[i]->referenceCount);
+    }
+
     submitted->usedTextureCount = 0;
     submitted->usedBufferCount = 0;
+    submitted->usedGraphicsPipelineCount = 0;
+    submitted->usedComputePipelineCount = 0;
 }
 
 // Returns every command buffer whose submission completed to the pool, and keeps the rest in submission order.
@@ -2796,6 +2854,8 @@ static void WEBGPU_INTERNAL_ReleaseTexture(WebGPURenderer *renderer, WebGPUTextu
 static void WEBGPU_INTERNAL_ReleaseSampler(WebGPURenderer *renderer, WebGPUSampler *sampler);
 static void WEBGPU_INTERNAL_ReleaseBuffer(WebGPURenderer *renderer, WebGPUBuffer *buffer);
 static void WEBGPU_INTERNAL_ReleaseBufferContainer(WebGPURenderer *renderer, WebGPUBufferContainer *container);
+static void WEBGPU_INTERNAL_ReleaseGraphicsPipeline(WebGPUGraphicsPipeline *pipeline);
+static void WEBGPU_INTERNAL_ReleaseComputePipeline(WebGPUComputePipeline *pipeline);
 
 // forceAll releases every queued resource even while it is still referenced; only a device being destroyed should ask for it.
 static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool forceAll)
@@ -2890,6 +2950,20 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
                 SDL_RemoveFromHashTable(renderer->bindGroupHashTable, &current.resource.bindGroup->key); // The key value destruction function also releases the bind group.
                 wasReleased = true;
 
+                break;
+            case WEBGPU_QUEUED_DESTROY_GRAPHICS_PIPELINE:
+                currentRefCount = SDL_GetAtomicInt(&current.resource.graphicsPipeline->referenceCount);
+                if (currentRefCount == 0 || forciblyDestroy) {
+                    WEBGPU_INTERNAL_ReleaseGraphicsPipeline(current.resource.graphicsPipeline);
+                    wasReleased = true;
+                }
+                break;
+            case WEBGPU_QUEUED_DESTROY_COMPUTE_PIPELINE:
+                currentRefCount = SDL_GetAtomicInt(&current.resource.computePipeline->referenceCount);
+                if (currentRefCount == 0 || forciblyDestroy) {
+                    WEBGPU_INTERNAL_ReleaseComputePipeline(current.resource.computePipeline);
+                    wasReleased = true;
+                }
                 break;
             }
 
@@ -4023,16 +4097,19 @@ static SDL_GPUGraphicsPipeline *WEBGPU_CreateGraphicsPipeline(SDL_GPURenderer *d
     return (SDL_GPUGraphicsPipeline *)pipeline;
 }
 
-static void WEBGPU_ReleaseGraphicsPipeline(SDL_GPURenderer *device, SDL_GPUGraphicsPipeline *_pipeline)
+static void WEBGPU_INTERNAL_ReleaseGraphicsPipeline(WebGPUGraphicsPipeline *pipeline)
 {
-    WebGPUGraphicsPipeline *pipeline = (WebGPUGraphicsPipeline *)_pipeline;
-
     wgpuRenderPipelineRelease(pipeline->pipeline);
     wgpuBindGroupLayoutRelease(pipeline->vertexBindGroupLayouts.samplerStorageBindGroupLayout);
     wgpuBindGroupLayoutRelease(pipeline->vertexBindGroupLayouts.uniformBindGroupLayout);
     wgpuBindGroupLayoutRelease(pipeline->fragmentBindGroupLayouts.samplerStorageBindGroupLayout);
     wgpuBindGroupLayoutRelease(pipeline->fragmentBindGroupLayouts.uniformBindGroupLayout);
     SDL_free(pipeline);
+}
+
+static void WEBGPU_ReleaseGraphicsPipeline(SDL_GPURenderer *device, SDL_GPUGraphicsPipeline *pipeline)
+{
+    WEBGPU_INTERNAL_QueueGraphicsPipelineForRelease((WebGPURenderer *)device, (WebGPUGraphicsPipeline *)pipeline);
 }
 
 static void WEBGPU_ReleaseFence(SDL_GPURenderer *device, SDL_GPUFence *fence)
@@ -5127,6 +5204,10 @@ static void WEBGPU_BindGraphicsPipeline(SDL_GPUCommandBuffer *renderPass, SDL_GP
 
     cmdBuf->boundGraphicsPipeline = ((WebGPUGraphicsPipeline *)graphicsPipeline);
     cmdBuf->hasBoundGraphicsPipeline = true;
+
+    SDL_AtomicIncRef(&cmdBuf->boundGraphicsPipeline->referenceCount);
+    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedGraphicsPipelines, cmdBuf->submitted.usedGraphicsPipelineCapacity, cmdBuf->submitted.usedGraphicsPipelineCount,
+                                           WebGPUGraphicsPipeline *, cmdBuf->boundGraphicsPipeline);
 }
 
 static void WEBGPU_BindVertexBuffers(SDL_GPUCommandBuffer *renderPass, Uint32 firstSlot, const SDL_GPUBufferBinding *binding, uint32_t numBindings)
@@ -5553,11 +5634,8 @@ static SDL_GPUComputePipeline *WEBGPU_CreateComputePipeline(SDL_GPURenderer *dev
     return (SDL_GPUComputePipeline *)pipeline;
 }
 
-static void WEBGPU_ReleaseComputePipeline(SDL_GPURenderer *driverData, SDL_GPUComputePipeline *computePipeline)
+static void WEBGPU_INTERNAL_ReleaseComputePipeline(WebGPUComputePipeline *pipeline)
 {
-    // FIXME: We're just trusting that the user's not an idiot and won't try to release a bound compute pipeline.
-    WebGPUComputePipeline *pipeline = (WebGPUComputePipeline *)computePipeline;
-
     wgpuComputePipelineRelease(pipeline->pipeline);
     wgpuShaderModuleRelease(pipeline->computeShader);
     wgpuBindGroupLayoutRelease(pipeline->bindGroupLayouts->readWriteStorageBindGroupLayout);
@@ -5565,7 +5643,12 @@ static void WEBGPU_ReleaseComputePipeline(SDL_GPURenderer *driverData, SDL_GPUCo
     wgpuBindGroupLayoutRelease(pipeline->bindGroupLayouts->uniformBindGroupLayout);
 
     SDL_free(pipeline->bindGroupLayouts);
-    SDL_free(computePipeline);
+    SDL_free(pipeline);
+}
+
+static void WEBGPU_ReleaseComputePipeline(SDL_GPURenderer *driverData, SDL_GPUComputePipeline *computePipeline)
+{
+    WEBGPU_INTERNAL_QueueComputePipelineForRelease((WebGPURenderer *)driverData, (WebGPUComputePipeline *)computePipeline);
 }
 
 static void WEBGPU_INTERNAL_BindComputeReadWriteStorageTextures(WebGPUCommandBuffer *cmdBuf,
@@ -5645,6 +5728,10 @@ static void WEBGPU_BindComputePipeline(SDL_GPUCommandBuffer *commandBuffer, SDL_
 
     cmdBuf->boundComputePipeline = (WebGPUComputePipeline *)computePipeline;
     cmdBuf->hasBoundComputePipeline = true;
+
+    SDL_AtomicIncRef(&pipeline->referenceCount);
+    WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedComputePipelines, cmdBuf->submitted.usedComputePipelineCapacity, cmdBuf->submitted.usedComputePipelineCount,
+                                           WebGPUComputePipeline *, pipeline);
 }
 
 static void WEBGPU_DispatchCompute(SDL_GPUCommandBuffer *commandBuffer, Uint32 groupcountX, Uint32 groupcountY, Uint32 groupcountZ)
