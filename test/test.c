@@ -484,8 +484,8 @@ static bool PixelsAreUniform(const Uint8 *pixels, Uint32 count, Uint32 bytes_per
     return true;
 }
 
-// Creates and releases a graphics and a compute pipeline, which must release every layout they created.
-static bool CreateAndReleasePipelines(SDL_GPUDevice *device)
+// Creates a graphics and a compute pipeline, counts the live layouts while both exist, then releases them.
+static bool CreateAndReleasePipelines(SDL_GPUDevice *device, int *out_live_layouts)
 {
     static const char vertex_code[] =
         "@vertex fn main() -> @builtin(position) vec4f {\n"
@@ -512,8 +512,52 @@ static bool CreateAndReleasePipelines(SDL_GPUDevice *device)
     if (!graphics_pipeline || !compute_pipeline) {
         return SDL_SetError("Creating the pipelines failed: %s", SDL_GetError());
     }
+    *out_live_layouts = CountLiveLayouts();
     SDL_ReleaseGPUGraphicsPipeline(device, graphics_pipeline);
     SDL_ReleaseGPUComputePipeline(device, compute_pipeline);
+    return true;
+}
+
+// Draws, caches bind groups and blits on a new device, then destroys it.
+static bool UseAndDestroyDevice(void)
+{
+    SDL_GPUDevice *device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_WGSL, true, NULL);
+    if (!device) {
+        return SDL_SetError("SDL_CreateGPUDevice: %s", SDL_GetError());
+    }
+    if (!DrawWithSharedSamplers(device)) {
+        return false;
+    }
+
+    SDL_GPUTextureCreateInfo texture_info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+        .width = 4,
+        .height = 4,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    };
+    SDL_GPUTexture *source = SDL_CreateGPUTexture(device, &texture_info);
+    SDL_GPUTexture *destination = SDL_CreateGPUTexture(device, &texture_info);
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(device);
+    if (!source || !destination || !cmd) {
+        return SDL_SetError("Creating the blit resources failed: %s", SDL_GetError());
+    }
+    SDL_GPUBlitInfo blit = {
+        .source = { .texture = source, .w = 4, .h = 4 },
+        .destination = { .texture = destination, .w = 4, .h = 4 },
+        .filter = SDL_GPU_FILTER_NEAREST,
+    };
+    SDL_BlitGPUTexture(cmd, &blit);
+    if (!SDL_SubmitGPUCommandBuffer(cmd)) {
+        return SDL_SetError("SDL_SubmitGPUCommandBuffer: %s", SDL_GetError());
+    }
+    SDL_WaitForGPUIdle(device);
+
+    SDL_ReleaseGPUTexture(device, destination);
+    SDL_ReleaseGPUTexture(device, source);
+    SDL_DestroyGPUDevice(device);
     return true;
 }
 
@@ -572,7 +616,6 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
     }
 
     // A window claimed by one device must not be claimable by another.
-    int layouts_before_device = CountLiveLayouts();
     SDL_GPUDevice *other_device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_WGSL, true, NULL);
     if (!other_device) {
         SDL_Log("Second SDL_CreateGPUDevice failed: %s", SDL_GetError());
@@ -584,11 +627,6 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
     }
     SDL_Log("Second claim rejected: %s", SDL_GetError());
     SDL_DestroyGPUDevice(other_device);
-    int layouts_after_device = CountLiveLayouts();
-    SDL_Log("Live layouts: %d before creating a device, %d after destroying it", layouts_before_device, layouts_after_device);
-    if (layouts_after_device != layouts_before_device) {
-        return SDL_APP_FAILURE;
-    }
 
     // 256-byte rows at offset 0: WebGPU writes the app layout directly.
     static Uint8 pixels[TEST_WIDTH * TEST_HEIGHT * 4];
@@ -649,14 +687,28 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
         return SDL_APP_FAILURE;
     }
 
+    // Pipelines keep their layouts after their shaders are released: 2 per graphics shader stage and 3 for compute.
     int layouts_before_pipelines = CountLiveLayouts();
-    if (!CreateAndReleasePipelines(state->device)) {
+    int layouts_with_pipelines = 0;
+    if (!CreateAndReleasePipelines(state->device, &layouts_with_pipelines)) {
         SDL_Log("Creating and releasing pipelines failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
     int layouts_after_pipelines = CountLiveLayouts();
-    SDL_Log("Live layouts: %d before creating pipelines, %d after releasing them", layouts_before_pipelines, layouts_after_pipelines);
-    if (layouts_after_pipelines != layouts_before_pipelines) {
+    SDL_Log("Live layouts: %d before creating pipelines, %d while they exist, %d after releasing them", layouts_before_pipelines, layouts_with_pipelines, layouts_after_pipelines);
+    if (layouts_with_pipelines != layouts_before_pipelines + 7 || layouts_after_pipelines != layouts_before_pipelines) {
+        return SDL_APP_FAILURE;
+    }
+
+    // Destroying a device must release every layout it created, including those of its blit pipelines and cached bind groups.
+    int layouts_before_device = CountLiveLayouts();
+    if (!UseAndDestroyDevice()) {
+        SDL_Log("Using and destroying a device failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    int layouts_after_device = CountLiveLayouts();
+    SDL_Log("Live layouts: %d before creating a device, %d after destroying it", layouts_before_device, layouts_after_device);
+    if (layouts_after_device != layouts_before_device) {
         return SDL_APP_FAILURE;
     }
 
