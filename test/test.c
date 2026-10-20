@@ -345,6 +345,129 @@ static bool WaitForFinishedAndPendingFences(SDL_GPUDevice *device, bool *out_pen
     return true;
 }
 
+static SDL_GPUShader *CreateShader(SDL_GPUDevice *device, const char *code, SDL_GPUShaderStage stage, Uint32 num_samplers)
+{
+    SDL_GPUShaderCreateInfo info = {
+        .code = (const Uint8 *)code,
+        .code_size = SDL_strlen(code),
+        .entrypoint = "main",
+        .format = SDL_GPU_SHADERFORMAT_WGSL,
+        .stage = stage,
+        .num_samplers = num_samplers,
+    };
+    return SDL_CreateGPUShader(device, &info);
+}
+
+static SDL_GPUGraphicsPipeline *CreatePipeline(SDL_GPUDevice *device, const char *vertex_code, Uint32 vertex_samplers, const char *fragment_code)
+{
+    SDL_GPUShader *vertex_shader = CreateShader(device, vertex_code, SDL_GPU_SHADERSTAGE_VERTEX, vertex_samplers);
+    SDL_GPUShader *fragment_shader = CreateShader(device, fragment_code, SDL_GPU_SHADERSTAGE_FRAGMENT, 1);
+    if (!vertex_shader || !fragment_shader) {
+        return NULL;
+    }
+
+    SDL_GPUColorTargetDescription color_target_description = { .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM };
+    SDL_GPUGraphicsPipelineCreateInfo info = {
+        .vertex_shader = vertex_shader,
+        .fragment_shader = fragment_shader,
+        .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+        .target_info = { .color_target_descriptions = &color_target_description, .num_color_targets = 1 },
+    };
+    SDL_GPUGraphicsPipeline *pipeline = SDL_CreateGPUGraphicsPipeline(device, &info);
+    SDL_ReleaseGPUShader(device, vertex_shader);
+    SDL_ReleaseGPUShader(device, fragment_shader);
+    return pipeline;
+}
+
+// Draws once with each pipeline in one submission and binds the same texture and sampler before each draw.
+static bool DrawWithPipelines(SDL_GPUDevice *device, SDL_GPUGraphicsPipeline *const *pipelines, int count, bool bind_vertex, SDL_GPUTexture *target, const SDL_GPUTextureSamplerBinding *binding)
+{
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(device);
+    if (!cmd) {
+        return SDL_SetError("SDL_AcquireGPUCommandBuffer: %s", SDL_GetError());
+    }
+    SDL_GPUColorTargetInfo color_target = { .texture = target, .load_op = SDL_GPU_LOADOP_CLEAR, .store_op = SDL_GPU_STOREOP_STORE };
+    SDL_GPURenderPass *render_pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL);
+    for (int i = 0; i < count; i++) {
+        SDL_BindGPUGraphicsPipeline(render_pass, pipelines[i]);
+        if (bind_vertex) {
+            SDL_BindGPUVertexSamplers(render_pass, 0, binding, 1);
+        }
+        SDL_BindGPUFragmentSamplers(render_pass, 0, binding, 1);
+        SDL_DrawGPUPrimitives(render_pass, 3, 1, 0, 0);
+    }
+    SDL_EndGPURenderPass(render_pass);
+    if (!SDL_SubmitGPUCommandBuffer(cmd)) {
+        return SDL_SetError("SDL_SubmitGPUCommandBuffer: %s", SDL_GetError());
+    }
+    SDL_WaitForGPUIdle(device);
+    return true;
+}
+
+#define SAMPLING_FRAGMENT_CODE \
+    "@group(2) @binding(0) var fragment_texture: texture_2d<f32>;\n" \
+    "@group(2) @binding(1) var fragment_sampler: sampler;\n" \
+    "@fragment fn main() -> @location(0) vec4f {\n" \
+    "    return textureSample(fragment_texture, fragment_sampler, vec2f(0.5));\n" \
+    "}\n"
+
+// Bind groups for the same texture and sampler must follow the layout of each pipeline and stage.
+static bool DrawWithSharedSamplers(SDL_GPUDevice *device)
+{
+    static const char vertex_code[] =
+        "@vertex fn main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {\n"
+        "    return vec4f(vec2f(f32(index & 1u), f32(index >> 1u)) * 4.0 - 1.0, 0.0, 1.0);\n"
+        "}\n";
+    static const char sampling_vertex_code[] =
+        "@group(0) @binding(0) var vertex_texture: texture_2d<f32>;\n"
+        "@group(0) @binding(1) var vertex_sampler: sampler;\n"
+        "@vertex fn main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {\n"
+        "    let uv = vec2f(f32(index & 1u), f32(index >> 1u));\n"
+        "    return vec4f(uv * 4.0 - 1.0, textureSampleLevel(vertex_texture, vertex_sampler, uv, 0.0).r, 1.0);\n"
+        "}\n";
+    // The directive makes the fragment texture unfilterable, so this layout differs from the plain one only in its sample type.
+    static const char unfilterable_fragment_code[] = "// SDLGPU_ForceAllowSamplingForTexture(2, 0)\n" SAMPLING_FRAGMENT_CODE;
+
+    SDL_GPUGraphicsPipeline *fragment_pipelines[2] = {
+        CreatePipeline(device, vertex_code, 0, SAMPLING_FRAGMENT_CODE),
+        CreatePipeline(device, vertex_code, 0, unfilterable_fragment_code),
+    };
+    SDL_GPUGraphicsPipeline *both_stages_pipeline = CreatePipeline(device, sampling_vertex_code, 1, SAMPLING_FRAGMENT_CODE);
+    if (!fragment_pipelines[0] || !fragment_pipelines[1] || !both_stages_pipeline) {
+        return SDL_SetError("Creating the pipelines failed: %s", SDL_GetError());
+    }
+
+    SDL_GPUTextureCreateInfo texture_info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+        .width = 4,
+        .height = 4,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    };
+    SDL_GPUTexture *source = SDL_CreateGPUTexture(device, &texture_info);
+    SDL_GPUTexture *target = SDL_CreateGPUTexture(device, &texture_info);
+    SDL_GPUSampler *sampler = SDL_CreateGPUSampler(device, &(SDL_GPUSamplerCreateInfo){ 0 });
+    if (!source || !target || !sampler) {
+        return SDL_SetError("Creating the draw resources failed: %s", SDL_GetError());
+    }
+
+    // Two pipelines whose fragment layouts differ, then one pipeline whose vertex and fragment layouts differ in visibility.
+    SDL_GPUTextureSamplerBinding binding = { .texture = source, .sampler = sampler };
+    if (!DrawWithPipelines(device, fragment_pipelines, 2, false, target, &binding) || !DrawWithPipelines(device, &both_stages_pipeline, 1, true, target, &binding)) {
+        return false;
+    }
+
+    SDL_ReleaseGPUSampler(device, sampler);
+    SDL_ReleaseGPUTexture(device, target);
+    SDL_ReleaseGPUTexture(device, source);
+    SDL_ReleaseGPUGraphicsPipeline(device, both_stages_pipeline);
+    SDL_ReleaseGPUGraphicsPipeline(device, fragment_pipelines[1]);
+    SDL_ReleaseGPUGraphicsPipeline(device, fragment_pipelines[0]);
+    return true;
+}
+
 static bool PixelsAreUniform(const Uint8 *pixels, Uint32 count, Uint32 bytes_per_pixel)
 {
     for (Uint32 i = 1; i < count; i++) {
@@ -480,6 +603,12 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
     if (!pending_fence_finished) {
         return SDL_APP_FAILURE;
     }
+
+    if (!DrawWithSharedSamplers(state->device)) {
+        SDL_Log("Drawing with shared samplers failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    SDL_Log("Drew with the same texture and sampler under different bind group layouts");
 
     // The backend reuses command buffers, fences and uniform staging memory, so a frame after warm-up allocates nothing.
     int frame_allocations = 0;

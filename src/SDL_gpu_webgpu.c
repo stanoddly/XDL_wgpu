@@ -961,6 +961,10 @@ typedef enum WebGPUQueuedDestroyType
 
 typedef struct WebGPUBindGroupCacheKey
 {
+    // The WGPUBindGroupLayout the bind group is created against, widened so the key has no padding to hash.
+    // It also separates the bind group types, since each type has its own layout.
+    Uint64 layout;
+
     Uint64 boundSamplersIDs[MAX_TEXTURE_SAMPLERS_PER_STAGE];
     Uint64 boundTexturesIDs[MAX_TEXTURE_SAMPLERS_PER_STAGE];
 
@@ -1020,6 +1024,9 @@ typedef struct WebGPUInferredBindGroupLayoutEntry
 typedef struct WebGPUBindGroup
 {
     WGPUBindGroup bindGroup;
+
+    // Referenced while the bind group is cached, so a new layout cannot reuse its address and match this key.
+    WGPUBindGroupLayout layout;
 
     WebGPUBindGroupCacheKey key;
 
@@ -1523,6 +1530,7 @@ static void WEBGPU_INTERNAL_DestroyCachedBindGroupAndKey(void *unused, const voi
     }
 
     wgpuBindGroupRelease(bindGroup->bindGroup);
+    wgpuBindGroupLayoutRelease(bindGroup->layout);
     SDL_free(bindGroup);
 }
 
@@ -2898,9 +2906,31 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
     SDL_UnlockMutex(renderer->submittingCommandBufferLock);
 }
 
+// The layout of the bound pipeline that a bind group of this type is created against.
+static WGPUBindGroupLayout WEBGPU_INTERNAL_GetBindGroupLayout(WebGPUCommandBuffer *cmdBuf, WebGPUBindGroupType type)
+{
+    switch (type) {
+    case WEBGPU_BINDGROUP_VERTEXSAMPLERSTORAGE:
+        return cmdBuf->boundGraphicsPipeline->vertexBindGroupLayouts.samplerStorageBindGroupLayout;
+    case WEBGPU_BINDGROUP_FRAGMENTSAMPLERSTORAGE:
+        return cmdBuf->boundGraphicsPipeline->fragmentBindGroupLayouts.samplerStorageBindGroupLayout;
+    case WEBGPU_BINDGROUP_COMPUTESAMPLERSTORAGE:
+        return cmdBuf->boundComputePipeline->bindGroupLayouts->samplerStorageBindGroupLayout;
+    case WEBGPU_BINDGROUP_COMPUTEREADWRITESTORAGE:
+        return cmdBuf->boundComputePipeline->bindGroupLayouts->readWriteStorageBindGroupLayout;
+    case WEBGPU_BINDGROUP_VERTEXUNIFORMS:
+    case WEBGPU_BINDGROUP_FRAGMENTUNIFORMS:
+    case WEBGPU_BINDGROUP_COMPUTEUNIFORMS:
+        break;
+    }
+
+    return NULL;
+}
+
 static WebGPUBindGroupCacheKey WEBGPU_INTERNAL_GenerateKeyForCurrentBinds(WebGPUCommandBuffer *cmdBuf, WebGPUBindGroupType desiredGroup)
 {
     WebGPUBindGroupCacheKey result = { 0 };
+    result.layout = (Uint64)(uintptr_t)WEBGPU_INTERNAL_GetBindGroupLayout(cmdBuf, desiredGroup);
 
     switch (desiredGroup) {
     case WEBGPU_BINDGROUP_VERTEXSAMPLERSTORAGE:
@@ -3054,7 +3084,6 @@ static WebGPUBindGroup *WEBGPU_INTERNAL_CreateBindGroup(WebGPUCommandBuffer *cmd
         }
 
         desc.entryCount = offset;
-        desc.layout = cmdBuf->boundGraphicsPipeline->vertexBindGroupLayouts.samplerStorageBindGroupLayout;
         break;
     }
     case WEBGPU_BINDGROUP_VERTEXUNIFORMS:
@@ -3112,7 +3141,6 @@ static WebGPUBindGroup *WEBGPU_INTERNAL_CreateBindGroup(WebGPUCommandBuffer *cmd
         }
 
         desc.entryCount = offset;
-        desc.layout = cmdBuf->boundGraphicsPipeline->fragmentBindGroupLayouts.samplerStorageBindGroupLayout;
 
         break;
     }
@@ -3170,7 +3198,6 @@ static WebGPUBindGroup *WEBGPU_INTERNAL_CreateBindGroup(WebGPUCommandBuffer *cmd
         }
 
         desc.entryCount = offset;
-        desc.layout = cmdBuf->boundComputePipeline->bindGroupLayouts->samplerStorageBindGroupLayout;
         break;
     }
     case WEBGPU_BINDGROUP_COMPUTEREADWRITESTORAGE:
@@ -3201,7 +3228,6 @@ static WebGPUBindGroup *WEBGPU_INTERNAL_CreateBindGroup(WebGPUCommandBuffer *cmd
         }
 
         desc.entryCount = offset;
-        desc.layout = cmdBuf->boundComputePipeline->bindGroupLayouts->readWriteStorageBindGroupLayout;
         break;
     }
     case WEBGPU_BINDGROUP_COMPUTEUNIFORMS:
@@ -3209,6 +3235,7 @@ static WebGPUBindGroup *WEBGPU_INTERNAL_CreateBindGroup(WebGPUCommandBuffer *cmd
     }
 
     desc.entries = entries;
+    desc.layout = WEBGPU_INTERNAL_GetBindGroupLayout(cmdBuf, type);
     desc.label = (WGPUStringView){ NULL, 0 };
     desc.nextInChain = NULL;
 
@@ -3221,6 +3248,8 @@ static WebGPUBindGroup *WEBGPU_INTERNAL_CreateBindGroup(WebGPUCommandBuffer *cmd
     result = SDL_calloc(1, sizeof(*result));
 
     result->bindGroup = bindGroup;
+    result->layout = desc.layout;
+    wgpuBindGroupLayoutAddRef(result->layout);
     result->key = key;
     result->invalid = false;
 
