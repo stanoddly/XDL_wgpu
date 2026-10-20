@@ -4236,8 +4236,8 @@ static void WEBGPU_INTERNAL_ReleaseBlitResources(WebGPURenderer *renderer)
     WEBGPU_INTERNAL_ReleaseBlitFragmentShaders(renderer, &renderer->blitResources.filterable);
     WEBGPU_INTERNAL_ReleaseBlitFragmentShaders(renderer, &renderer->blitResources.unfilterable);
     WEBGPU_INTERNAL_ReleaseShader((WebGPUShader *)renderer->blitResources.blitVertexShader);
-    WEBGPU_INTERNAL_ReleaseSampler(renderer, (WebGPUSampler *)renderer->blitResources.blitLinearSampler);
-    WEBGPU_INTERNAL_ReleaseSampler(renderer, (WebGPUSampler *)renderer->blitResources.blitNearestSampler);
+    WEBGPU_ReleaseSampler((SDL_GPURenderer *)renderer, renderer->blitResources.blitLinearSampler);
+    WEBGPU_ReleaseSampler((SDL_GPURenderer *)renderer, renderer->blitResources.blitNearestSampler);
 }
 
 static WebGPUBuffer *WEBGPU_INTERNAL_CreateBuffer(WebGPURenderer *renderer, Uint64 size, SDL_GPUBufferUsageFlags usageFlags, WebGPUBufferType bufferType, const char *debugName)
