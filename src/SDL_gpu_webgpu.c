@@ -2045,6 +2045,7 @@ static bool WEBGPU_INTERNAL_WaitForFences(WebGPURenderer *renderer, bool waitAll
     Uint32 triggeredFenceThreshold = waitAll ? num_fences : 1;
 
     while (triggeredFenceCount < triggeredFenceThreshold) {
+        triggeredFenceCount = 0;
         for (int i = 0; i < num_fences; i++) {
             if (WEBGPU_INTERNAL_QueryFence(renderer, fences[i])) {
                 triggeredFenceCount++;

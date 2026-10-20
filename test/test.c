@@ -302,6 +302,49 @@ static SDL_GPUTexture *CreateFrameSource(SDL_GPUDevice *device, SDL_GPUTextureFo
     return SDL_CreateGPUTexture(device, &info);
 }
 
+// Waiting for all of a finished fence and a pending one must not return before the pending one finishes.
+static bool WaitForFinishedAndPendingFences(SDL_GPUDevice *device, bool *out_pending_finished)
+{
+    SDL_GPUBufferCreateInfo buffer_info = { .usage = SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ, .size = 64 * 1024 * 1024 };
+    SDL_GPUBuffer *source = SDL_CreateGPUBuffer(device, &buffer_info);
+    SDL_GPUBuffer *destination = SDL_CreateGPUBuffer(device, &buffer_info);
+    if (!source || !destination) {
+        return SDL_SetError("SDL_CreateGPUBuffer: %s", SDL_GetError());
+    }
+
+    SDL_GPUFence *fences[2];
+    for (int i = 0; i < 2; i++) {
+        SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(device);
+        if (!cmd) {
+            return SDL_SetError("SDL_AcquireGPUCommandBuffer: %s", SDL_GetError());
+        }
+        // Copying a large buffer many times keeps the second fence pending while the first one is polled again.
+        if (i == 1) {
+            SDL_GPUCopyPass *copy_pass = SDL_BeginGPUCopyPass(cmd);
+            for (int copy = 0; copy < 256; copy++) {
+                SDL_CopyGPUBufferToBuffer(copy_pass, &(SDL_GPUBufferLocation){ .buffer = source }, &(SDL_GPUBufferLocation){ .buffer = destination }, buffer_info.size, false);
+            }
+            SDL_EndGPUCopyPass(copy_pass);
+        }
+        fences[i] = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+        if (!fences[i]) {
+            return SDL_SetError("SDL_SubmitGPUCommandBufferAndAcquireFence: %s", SDL_GetError());
+        }
+        if (i == 0) {
+            SDL_WaitForGPUFences(device, true, fences, 1);
+        }
+    }
+
+    SDL_WaitForGPUFences(device, true, fences, 2);
+    *out_pending_finished = SDL_QueryGPUFence(device, fences[1]);
+    SDL_WaitForGPUIdle(device);
+    SDL_ReleaseGPUFence(device, fences[0]);
+    SDL_ReleaseGPUFence(device, fences[1]);
+    SDL_ReleaseGPUBuffer(device, source);
+    SDL_ReleaseGPUBuffer(device, destination);
+    return true;
+}
+
 static bool PixelsAreUniform(const Uint8 *pixels, Uint32 count, Uint32 bytes_per_pixel)
 {
     for (Uint32 i = 1; i < count; i++) {
@@ -425,6 +468,16 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
     }
     SDL_Log("Upload 4x2x2 with rows_per_layer 3: slice 0 = %u, slice 1 = %u (match: %s)", volume_pixels[0], volume_pixels[sizeof(volume_pixels) / 2], slices_match ? "yes" : "no");
     if (!slices_match) {
+        return SDL_APP_FAILURE;
+    }
+
+    bool pending_fence_finished = false;
+    if (!WaitForFinishedAndPendingFences(state->device, &pending_fence_finished)) {
+        SDL_Log("Fence wait test failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    SDL_Log("Waiting for all of a finished and a pending fence: pending fence finished: %s", pending_fence_finished ? "yes" : "no");
+    if (!pending_fence_finished) {
         return SDL_APP_FAILURE;
     }
 
