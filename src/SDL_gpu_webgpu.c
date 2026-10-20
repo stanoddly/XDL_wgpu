@@ -1170,10 +1170,8 @@ typedef struct WebGPUSampler
 
     Uint64 identifier;
 
-    char **dependants;
-
-    Uint32 numDependants;
-    Uint32 dependantsCapacity;
+    // One reference for each bind in a command buffer that is recording or whose submission has not completed.
+    SDL_AtomicInt referenceCount;
 } WebGPUSampler;
 
 typedef struct WebGPUFence
@@ -1356,6 +1354,10 @@ struct WebGPUSubmittedCommandBuffer
     WebGPUComputePipeline **usedComputePipelines;
     Uint32 usedComputePipelineCount;
     Uint32 usedComputePipelineCapacity;
+
+    WebGPUSampler **usedSamplers;
+    Uint32 usedSamplerCount;
+    Uint32 usedSamplerCapacity;
 };
 
 struct WebGPUCommandBuffer
@@ -1973,6 +1975,7 @@ static void WEBGPU_INTERNAL_FreeCommandBuffer(WebGPUCommandBuffer *cmdBuf)
     SDL_free(cmdBuf->submitted.usedTextures);
     SDL_free(cmdBuf->submitted.usedGraphicsPipelines);
     SDL_free(cmdBuf->submitted.usedComputePipelines);
+    SDL_free(cmdBuf->submitted.usedSamplers);
     SDL_free(cmdBuf->queuedRepacks);
     SDL_free(cmdBuf->surfaces);
     SDL_free(cmdBuf->acquiredSwapchainTextures);
@@ -1995,6 +1998,8 @@ static void WEBGPU_INTERNAL_ReturnCommandBufferToPool(WebGPURenderer *renderer, 
     cmdBuf->submitted.usedGraphicsPipelineCapacity = recycled.submitted.usedGraphicsPipelineCapacity;
     cmdBuf->submitted.usedComputePipelines = recycled.submitted.usedComputePipelines;
     cmdBuf->submitted.usedComputePipelineCapacity = recycled.submitted.usedComputePipelineCapacity;
+    cmdBuf->submitted.usedSamplers = recycled.submitted.usedSamplers;
+    cmdBuf->submitted.usedSamplerCapacity = recycled.submitted.usedSamplerCapacity;
     cmdBuf->queuedRepacks = recycled.queuedRepacks;
     cmdBuf->queuedRepackCapacity = recycled.queuedRepackCapacity;
     cmdBuf->queuedUniformUploads = recycled.queuedUniformUploads;
@@ -2805,10 +2810,15 @@ static void WEBGPU_INTERNAL_ReleaseTrackedResources(WebGPUSubmittedCommandBuffer
         (void)SDL_AtomicDecRef(&submitted->usedComputePipelines[i]->referenceCount);
     }
 
+    for (Uint32 i = 0; i < submitted->usedSamplerCount; i++) {
+        (void)SDL_AtomicDecRef(&submitted->usedSamplers[i]->referenceCount);
+    }
+
     submitted->usedTextureCount = 0;
     submitted->usedBufferCount = 0;
     submitted->usedGraphicsPipelineCount = 0;
     submitted->usedComputePipelineCount = 0;
+    submitted->usedSamplerCount = 0;
 }
 
 // Returns every command buffer whose submission completed to the pool, and keeps the rest in submission order.
@@ -2911,7 +2921,7 @@ static void WEBGPU_INTERNAL_HandlePendingDestroys(WebGPURenderer *renderer, bool
                 }
                 break;
             case WEBGPU_QUEUED_DESTROY_SAMPLER:
-                currentRefCount = current.resource.sampler->numDependants;
+                currentRefCount = SDL_GetAtomicInt(&current.resource.sampler->referenceCount);
                 if (currentRefCount == 0 || forceAll) {
                     WEBGPU_INTERNAL_ReleaseSampler(renderer, current.resource.sampler);
                     wasReleased = true;
@@ -3582,12 +3592,7 @@ static SDL_GPUSampler *WEBGPU_CreateSampler(SDL_GPURenderer *device, const SDL_G
 
 static void WEBGPU_INTERNAL_ReleaseSampler(WebGPURenderer *renderer, WebGPUSampler *sampler)
 {
-    for (int i = 0; i < sampler->numDependants; i++) {
-        // WEBGPU_INTERNAL_InvalidateBindGroup(renderer, sampler->dependants[i]);
-    }
-
     wgpuSamplerRelease(sampler->sampler);
-    SDL_free(sampler->dependants);
     SDL_free(sampler);
 }
 
@@ -5247,6 +5252,9 @@ static void WEBGPU_BindVertexSamplers(SDL_GPUCommandBuffer *renderPass, Uint32 f
             }
         }
         cmdBuf->vertexStageBinds.boundSamplers[i + firstSlot] = (WebGPUSampler *)textureSamplerBindings[i].sampler;
+        WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedSamplers, cmdBuf->submitted.usedSamplerCapacity, cmdBuf->submitted.usedSamplerCount,
+                                               WebGPUSampler *, (WebGPUSampler *)textureSamplerBindings[i].sampler);
+        SDL_AtomicIncRef(&((WebGPUSampler *)textureSamplerBindings[i].sampler)->referenceCount);
         cmdBuf->vertexStageBinds.boundTextures[i + firstSlot] = ((WebGPUTextureContainer *)textureSamplerBindings[i].texture)->activeTexture->fullTextureView;
 
         WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedTextures, cmdBuf->submitted.usedTextureCapacity, cmdBuf->submitted.usedTextureCount,
@@ -5300,6 +5308,9 @@ static void WEBGPU_BindFragmentSamplers(SDL_GPUCommandBuffer *renderPass, Uint32
         }
         // Bounds-checking is for cowards too afraid to accept the inherent randomness of the universe, and the innate beauty that it creates.
         cmdBuf->fragmentStageBinds.boundSamplers[i + firstSlot] = (WebGPUSampler *)textureSamplerBindings[i].sampler;
+        WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedSamplers, cmdBuf->submitted.usedSamplerCapacity, cmdBuf->submitted.usedSamplerCount,
+                                               WebGPUSampler *, (WebGPUSampler *)textureSamplerBindings[i].sampler);
+        SDL_AtomicIncRef(&((WebGPUSampler *)textureSamplerBindings[i].sampler)->referenceCount);
         cmdBuf->fragmentStageBinds.boundTextures[i + firstSlot] = ((WebGPUTextureContainer *)textureSamplerBindings[i].texture)->activeTexture->fullTextureView;
 
         WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedTextures, cmdBuf->submitted.usedTextureCapacity, cmdBuf->submitted.usedTextureCount,
@@ -5344,6 +5355,9 @@ static void WEBGPU_BindComputeSamplers(SDL_GPUCommandBuffer *commandBuffer, Uint
 
     for (int i = 0; i < numBindings; i++) {
         cmdBuf->computeStageBinds.boundSamplers[i + firstSlot] = (WebGPUSampler *)textureSamplerBindings[i].sampler;
+        WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedSamplers, cmdBuf->submitted.usedSamplerCapacity, cmdBuf->submitted.usedSamplerCount,
+                                               WebGPUSampler *, (WebGPUSampler *)textureSamplerBindings[i].sampler);
+        SDL_AtomicIncRef(&((WebGPUSampler *)textureSamplerBindings[i].sampler)->referenceCount);
         cmdBuf->computeStageBinds.boundTextures[i + firstSlot] = ((WebGPUTextureContainer *)textureSamplerBindings[i].texture)->activeTexture->fullTextureView;
 
         WEBGPU_INTERNAL_InsertElementIntoArray(cmdBuf->submitted.usedTextures, cmdBuf->submitted.usedTextureCapacity, cmdBuf->submitted.usedTextureCount,
