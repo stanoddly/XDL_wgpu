@@ -83,7 +83,7 @@ static int CountLiveLayouts(void)
 static int CountLiveResources(void)
 {
     return EM_ASM_INT({
-        return Object.values(WebGPU.Internals.jsObjects).filter(o => o instanceof GPURenderPipeline || o instanceof GPUComputePipeline || o instanceof GPUTexture || o instanceof GPUBuffer).length;
+        return Object.values(WebGPU.Internals.jsObjects).filter(o => o instanceof GPURenderPipeline || o instanceof GPUComputePipeline || o instanceof GPUTexture || o instanceof GPUBuffer || o instanceof GPUSampler).length;
     });
 }
 
@@ -534,9 +534,25 @@ static bool CreateAndReleasePipelines(SDL_GPUDevice *device, int *out_live_layou
     return true;
 }
 
-// Releases two pipelines, a texture and a buffer while they are bound in a recording command buffer, runs many destroy passes,
-// then uses them. Counts the live resources before the release, after the passes while recording, and after the submission completes.
-static bool UseReleasedResources(SDL_GPUDevice *device, int out_live_resources[3])
+// Each wait runs a destroy pass. The backend used to force a destroy after 10000 failed attempts, even while referenced.
+// The passes warn every 100 attempts, which is expected here.
+static bool RunDestroyPasses(SDL_GPUDevice *device, int expected_live_resources)
+{
+    SDL_LogPriority gpu_log_priority = SDL_GetLogPriority(SDL_LOG_CATEGORY_GPU);
+    SDL_SetLogPriority(SDL_LOG_CATEGORY_GPU, SDL_LOG_PRIORITY_ERROR);
+    for (int i = 0; i <= 10000; i++) {
+        SDL_WaitForGPUIdle(device);
+    }
+    SDL_SetLogPriority(SDL_LOG_CATEGORY_GPU, gpu_log_priority);
+    if (CountLiveResources() != expected_live_resources) {
+        return SDL_SetError("A destroy pass freed a resource that the recording command buffer still uses");
+    }
+    return true;
+}
+
+// Releases two pipelines, a texture, a sampler and a buffer while they are bound in a recording command buffer,
+// runs many destroy passes, then uses them. Counts the live resources before the release and after the submission completes.
+static bool UseReleasedResources(SDL_GPUDevice *device, int out_live_resources[2])
 {
     SDL_GPUGraphicsPipeline *graphics_pipeline = CreatePipeline(device, ORIGIN_VERTEX_CODE, 0, SAMPLING_FRAGMENT_CODE);
     SDL_GPUComputePipeline *compute_pipeline = CreateComputePipeline(device);
@@ -565,6 +581,10 @@ static bool UseReleasedResources(SDL_GPUDevice *device, int out_live_resources[3
     SDL_BindGPUFragmentSamplers(render_pass, 0, &(SDL_GPUTextureSamplerBinding){ .texture = source, .sampler = sampler }, 1);
     SDL_ReleaseGPUGraphicsPipeline(device, graphics_pipeline);
     SDL_ReleaseGPUTexture(device, source);
+    SDL_ReleaseGPUSampler(device, sampler);
+    if (!RunDestroyPasses(device, out_live_resources[0])) {
+        return false;
+    }
     SDL_DrawGPUPrimitives(render_pass, 3, 1, 0, 0);
     SDL_EndGPURenderPass(render_pass);
 
@@ -572,29 +592,18 @@ static bool UseReleasedResources(SDL_GPUDevice *device, int out_live_resources[3
     SDL_BindGPUComputePipeline(compute_pass, compute_pipeline);
     SDL_ReleaseGPUComputePipeline(device, compute_pipeline);
     SDL_ReleaseGPUBuffer(device, buffer);
-
-    // Each wait runs a destroy pass. The backend used to force a destroy after 10000 failed attempts, even while referenced.
-    // The passes warn every 100 attempts, which is expected here.
-    SDL_LogPriority gpu_log_priority = SDL_GetLogPriority(SDL_LOG_CATEGORY_GPU);
-    SDL_SetLogPriority(SDL_LOG_CATEGORY_GPU, SDL_LOG_PRIORITY_ERROR);
-    for (int i = 0; i <= 10000; i++) {
-        SDL_WaitForGPUIdle(device);
+    if (!RunDestroyPasses(device, out_live_resources[0])) {
+        return false;
     }
-    SDL_SetLogPriority(SDL_LOG_CATEGORY_GPU, gpu_log_priority);
-    out_live_resources[1] = CountLiveResources();
-    if (out_live_resources[1] != out_live_resources[0]) {
-        return SDL_SetError("A destroy pass freed a resource that the recording command buffer still uses");
-    }
-
     SDL_DispatchGPUCompute(compute_pass, 1, 1, 1);
     SDL_EndGPUComputePass(compute_pass);
+
     if (!SDL_SubmitGPUCommandBuffer(cmd)) {
         return SDL_SetError("SDL_SubmitGPUCommandBuffer: %s", SDL_GetError());
     }
     SDL_WaitForGPUIdle(device);
-    out_live_resources[2] = CountLiveResources();
+    out_live_resources[1] = CountLiveResources();
 
-    SDL_ReleaseGPUSampler(device, sampler);
     SDL_ReleaseGPUTexture(device, target);
     return true;
 }
@@ -782,13 +791,13 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv)
     }
 
     // A released resource stays alive while a command buffer that bound it records or runs.
-    int live_resources[3] = { 0 };
+    int live_resources[2] = { 0 };
     if (!UseReleasedResources(state->device, live_resources)) {
         SDL_Log("Using released resources failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
-    SDL_Log("Live resources: %d before releasing 4 bound ones, %d while recording, %d after the submission", live_resources[0], live_resources[1], live_resources[2]);
-    if (live_resources[2] != live_resources[0] - 4) {
+    SDL_Log("Live resources: %d before releasing 5 bound ones, %d after the submission", live_resources[0], live_resources[1]);
+    if (live_resources[1] != live_resources[0] - 5) {
         return SDL_APP_FAILURE;
     }
 
